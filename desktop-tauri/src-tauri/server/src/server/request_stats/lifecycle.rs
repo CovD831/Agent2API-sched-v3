@@ -21,7 +21,9 @@ pub(super) fn finish_stale(conn: &Connection, cutoff: i64, now: i64) -> rusqlite
     super::source_backfill::backfill_sources(conn)?;
     let mut entries = {
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM requests WHERE status = 0 AND ts < ?1", sql::REQUEST_COLUMNS,
+            "SELECT {} FROM {} WHERE r.status = 0 AND r.ts < ?1",
+            sql::REQUEST_JOIN_COLUMNS,
+            sql::REQUEST_DETAILS_JOIN,
         ))?;
         let rows = stmt.query_map(params![cutoff], sql::decode_request)?.collect::<rusqlite::Result<Vec<_>>>()?;
         rows
@@ -52,7 +54,9 @@ impl RequestStats {
             sql::update_running_progress(&tx, id, progress)?;
             let mut entries = {
                 let mut stmt = tx.prepare(&format!(
-                    "SELECT {} FROM requests WHERE id = ?1 AND status = 0", sql::REQUEST_COLUMNS,
+                    "SELECT {} FROM {} WHERE r.id = ?1 AND r.status = 0",
+                    sql::REQUEST_JOIN_COLUMNS,
+                    sql::REQUEST_DETAILS_JOIN,
                 ))?;
                 let rows = stmt.query_map(params![id], sql::decode_request)?.collect::<rusqlite::Result<Vec<_>>>()?;
                 rows

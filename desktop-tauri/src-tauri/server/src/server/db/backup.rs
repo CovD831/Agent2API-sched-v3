@@ -66,6 +66,7 @@ const ACCOUNT_KEY_FILE: &str = "account.key";
 const LOG_TABLES: &[&str] = &[
     "logs",
     "requests",
+    "request_details",
     "request_daily",
     "debug_traffic",
     "request_raw",
@@ -662,6 +663,7 @@ fn table_row_counts(conn: &Connection, skip: &[&str]) -> Vec<Value> {
         "accounts",
         "logs",
         "requests",
+        "request_details",
         "request_daily",
         "debug_traffic",
         "request_raw",

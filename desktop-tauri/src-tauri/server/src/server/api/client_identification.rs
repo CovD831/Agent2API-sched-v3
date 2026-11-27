@@ -70,10 +70,14 @@ fn preview(state: &ServerState, payload: PreviewSettings) -> Result<Value, Gatew
     }
     // 先限制扫描窗口，再解码证据；大日志库不因一次预览做全库扫描。
     let db = state.db().ok_or_else(|| GatewayError::new("数据库不可用，无法预览识别规则"))?;
-    let records = db.with(|conn| {
-        let mut stmt = conn.prepare("SELECT id, ts, client, client_evidence FROM \
-            (SELECT row_id, id, ts, client, client_evidence FROM requests ORDER BY row_id DESC LIMIT 500) \
-            WHERE client_evidence <> '{}' ORDER BY row_id DESC")?;
+    let records = db.with_read(|conn| {
+        let mut stmt = conn.prepare("SELECT id, ts, client, evidence FROM \
+            (SELECT r.row_id, r.id, r.ts, r.client, \
+                    CASE WHEN (r.detail_flags & 32) <> 0 THEN COALESCE(d.client_evidence, '{}') ELSE r.client_evidence END AS evidence \
+             FROM requests r \
+             LEFT JOIN request_details d ON d.row_id = r.row_id \
+             ORDER BY r.row_id DESC LIMIT 500) \
+            WHERE evidence <> '{}' ORDER BY row_id DESC")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
     }).ok_or_else(|| GatewayError::new("读取近期请求失败"))?

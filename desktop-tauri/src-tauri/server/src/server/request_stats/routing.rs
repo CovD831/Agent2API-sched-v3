@@ -11,9 +11,7 @@ impl RequestStats {
             .and_then(|time| time.and_local_timezone(chrono::Local).earliest())
             .map(|time| time.timestamp_millis()).unwrap_or(0);
         let model = model.unwrap_or("");
-        let loaded = {
-            let guard = self.guard();
-            self.with_conn(&guard, |conn| {
+        let loaded = self.with_read_conn(|conn| {
                 let (running, requests, successful, duration): (i64, i64, i64, i64) = conn.query_row(
                     "SELECT COALESCE(SUM(status = 0 AND error IS NULL AND ts >= ?3), 0),
                      COALESCE(SUM(ts >= ?1 AND (status <> 0 OR error IS NOT NULL) AND is_test = 0), 0),
@@ -39,39 +37,38 @@ impl RequestStats {
                     "averageDurationMs": if successful > 0 { Some(duration / successful) } else { None },
                     "accountRunning": counts,
                 }))
-            })
-        };
+        });
         loaded.unwrap_or_else(|| json!({ "available": false }))
     }
 
     pub fn routing_replays(&self, model: Option<&str>, offset: usize, limit: usize, status: &str) -> Value {
         let model = model.unwrap_or("");
         let limit = limit.clamp(1, 100);
+        let has_route = "(((r.detail_flags & 32) <> 0 AND (r.detail_flags & 1) <> 0) OR ((r.detail_flags & 32) = 0 AND r.route IS NOT NULL))";
         let status_clause = match status {
-            "error" => " AND status <> 0 AND NOT (status >= 200 AND status < 300 AND error IS NULL)",
-            "sticky" => " AND json_valid(route) AND json_extract(route, '$.stickyHit') = 1",
+            "error" => " AND r.status <> 0 AND NOT (r.status >= 200 AND r.status < 300 AND r.error IS NULL)",
+            "sticky" => " AND CASE WHEN (r.detail_flags & 32) <> 0 THEN ((r.detail_flags & 16) <> 0) WHEN json_valid(r.route) THEN json_extract(r.route, '$.stickyHit') = 1 ELSE 0 END = 1",
             _ => "",
         };
-        let loaded = {
-            let guard = self.guard();
-            self.with_conn(&guard, |conn| {
-                let matched: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM requests WHERE route IS NOT NULL
-                     AND (?1 = '' OR model = ?1 COLLATE NOCASE){status_clause}"),
-                    params![model], |row| row.get(0),
-                )?;
-                let query = format!(
-                    "SELECT {} FROM requests WHERE route IS NOT NULL
-                     AND (?1 = '' OR model = ?1 COLLATE NOCASE){status_clause}
-                     ORDER BY ts DESC, row_id DESC LIMIT ?2 OFFSET ?3", sql::REQUEST_COLUMNS,
-                );
-                let mut stmt = conn.prepare(&query)?;
-                let mut rows = stmt.query(params![model, limit as i64, offset as i64])?;
-                let mut entries = Vec::new();
-                while let Some(row) = rows.next()? { entries.push(entry_json(&sql::decode_request(row)?)); }
-                Ok(json!({ "entries": entries, "matched": matched, "offset": offset, "limit": limit }))
-            })
-        };
+        let loaded = self.with_read_conn(|conn| {
+            let matched: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM requests r WHERE {has_route}
+                 AND (?1 = '' OR r.model = ?1 COLLATE NOCASE){status_clause}"),
+                params![model], |row| row.get(0),
+            )?;
+            let query = format!(
+                "SELECT {} FROM {} WHERE {has_route}
+                 AND (?1 = '' OR r.model = ?1 COLLATE NOCASE){status_clause}
+                 ORDER BY r.ts DESC, r.row_id DESC LIMIT ?2 OFFSET ?3",
+                sql::REQUEST_JOIN_COLUMNS,
+                sql::REQUEST_DETAILS_JOIN,
+            );
+            let mut stmt = conn.prepare(&query)?;
+            let mut rows = stmt.query(params![model, limit as i64, offset as i64])?;
+            let mut entries = Vec::new();
+            while let Some(row) = rows.next()? { entries.push(entry_json(&sql::decode_request(row)?)); }
+            Ok(json!({ "entries": entries, "matched": matched, "offset": offset, "limit": limit }))
+        });
         loaded.unwrap_or_else(|| json!({ "entries": [], "matched": 0, "available": false }))
     }
 }

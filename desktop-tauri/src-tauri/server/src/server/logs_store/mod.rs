@@ -282,6 +282,23 @@ impl LogStore {
         }
     }
 
+    fn with_read_conn<T>(
+        &self,
+        action: impl FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Option<T> {
+        match self.db.as_ref()?.with_read(action) {
+            Some(Ok(value)) => Some(value),
+            Some(Err(error)) => {
+                eprintln!("[Logs] 日志数据库只读操作失败: {error}");
+                None
+            }
+            None => {
+                eprintln!("[Logs] 日志数据库不可用（连接已标记中毒）");
+                None
+            }
+        }
+    }
+
     fn with_conn_mut<T>(
         &self,
         _guard: &MutexGuard<'_, ()>,
@@ -376,9 +393,8 @@ impl LogStore {
     }
 
     pub fn query(&self, query: &Query) -> QueryResult {
-        let guard = self.guard();
         let key = format!("{query:?}");
-        if let Some(cached) = self.cached_query(&guard, &key) {
+        if let Some(cached) = self.cached_query(&key) {
             return cached;
         }
         let plan = sql::FilterPlan::of(query);
@@ -394,7 +410,7 @@ impl LogStore {
             by_level: empty_level_map(),
             last_id: 0,
         };
-        let computed = self.with_conn(&guard, |conn| -> rusqlite::Result<QueryResult> {
+        let computed = self.with_read_conn(|conn| -> rusqlite::Result<QueryResult> {
             let total = sql::count_all(conn)?;
             let last_id = sql::max_id(conn)?;
             let filtered = sql::select_matching_desc(conn, &plan)?;
@@ -428,11 +444,11 @@ impl LogStore {
         let Some(result) = computed else {
             return fallback;
         };
-        self.store_query_cache(&guard, key, &result);
+        self.store_query_cache(key, &result);
         result
     }
 
-    fn cached_query(&self, _guard: &MutexGuard<'_, ()>, key: &str) -> Option<QueryResult> {
+    fn cached_query(&self, key: &str) -> Option<QueryResult> {
         let epoch = cache_epoch();
         let cache = self
             .query_cache
@@ -444,7 +460,7 @@ impl LogStore {
             .map(|entry| entry.result.clone())
     }
 
-    fn store_query_cache(&self, _guard: &MutexGuard<'_, ()>, key: String, result: &QueryResult) {
+    fn store_query_cache(&self, key: String, result: &QueryResult) {
         let epoch = cache_epoch();
         let mut cache = self
             .query_cache
@@ -488,7 +504,6 @@ impl LogStore {
     }
 
     pub fn stats(&self) -> Stats {
-        let guard = self.guard();
         let epoch = cache_epoch();
         {
             let cache = self
@@ -501,7 +516,7 @@ impl LogStore {
                 }
             }
         }
-        let loaded = self.with_conn(&guard, sql::stats_snapshot);
+        let loaded = self.with_read_conn(|conn| sql::stats_snapshot(conn));
         let (total, last_id, buckets) = match loaded {
             Some(value) => value,
             _ => {
@@ -560,18 +575,16 @@ impl LogStore {
     }
 
     pub fn to_jsonl(&self) -> String {
-        let guard = self.guard();
         let entries = self
-            .with_conn(&guard, sql::select_all_asc)
+            .with_read_conn(|conn| sql::select_all_asc(conn))
             .unwrap_or_default();
         render_jsonl(&entries)
     }
 
     pub fn to_jsonl_where(&self, query: &Query) -> String {
-        let guard = self.guard();
         let plan = sql::FilterPlan::of(query);
         let mut entries = self
-            .with_conn(&guard, |conn| sql::select_matching_desc(conn, &plan))
+            .with_read_conn(|conn| sql::select_matching_desc(conn, &plan))
             .unwrap_or_default();
         entries.reverse();
         render_jsonl(&entries)
@@ -579,8 +592,7 @@ impl LogStore {
 
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        let guard = self.guard();
-        self.with_conn(&guard, sql::count_all).unwrap_or(0)
+        self.with_read_conn(|conn| sql::count_all(conn)).unwrap_or(0)
     }
 
     #[allow(dead_code)]

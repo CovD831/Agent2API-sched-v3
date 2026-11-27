@@ -61,6 +61,7 @@ use serde_json::Value;
 use super::record::{AttemptDetail, RequestEntry, RequestListRow, RequestQuery, RunningProgress, SensitiveHit};
 use super::report::normalize_status_filter;
 pub(super) use super::cache_report::{select_summary_rows, sum_cache_windows};
+use crate::server::core::client::ClientEvidence;
 
 mod raw;
 pub(super) use raw::{
@@ -68,41 +69,136 @@ pub(super) use raw::{
     upsert_raw,
 };
 
-/// `requests` 的列顺序（所有 SELECT 都按这个顺序取，`decode_request` 依赖它；
-/// 不写 `SELECT *` 是为了「加列时读侧要显式跟上」这件事在 diff 里可见）
-///
-/// **新列一律追加在末尾**：`decode_request` 按序号取值，只有追加才不会牵动
-/// 前面字段的序号（中间插一列会让所有后续字段整体挪一位，那种改动在整个文件里
-/// 看不出错，只会静默取错值）。因此后加的列都在最后：
-///   - `attempt_details` / `sensitive_hits`（schema v2 的 JSON 文本列）；
-///   - `credit`（schema v23 的积分消耗，可空 REAL）。
-pub(super) const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
-     first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
-     cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, route, client, \
-     api_key_id, api_key_name, api_key_source, credit, client_evidence";
+pub(super) const FLAG_HAS_ROUTE: i64 = 1 << 0;
+pub(super) const FLAG_HAS_SENSITIVE_HITS: i64 = 1 << 1;
+pub(super) const FLAG_HAS_PROCESS_FACTS: i64 = 1 << 2;
+pub(super) const FLAG_HAS_CLIENT_EVIDENCE: i64 = 1 << 3;
+pub(super) const FLAG_STICKY_HIT: i64 = 1 << 4;
+pub(super) const FLAG_DETAILS_SPLIT: i64 = 1 << 5;
 
-/// 列表页轻量查询列：跳过四个大 JSON 文本列，仅在 SQL 里判定极轻量布尔/字符串提示，
-/// 彻底省掉整页行上的 JSON 解析与超大对象序列化开销。
+struct DetailMeta {
+    flags: i64,
+    internal_retries: i64,
+    vision_mode: String,
+    recorded_client_name: String,
+    client_user_agent: String,
+    session_id: String,
+    session_source: String,
+}
+
+fn route_meta(route: &Value) -> (bool, bool, String, String, String) {
+    if route.is_null() {
+        return (false, false, String::new(), String::new(), String::new());
+    }
+    let vision_mode = route
+        .get("visionCompatibility")
+        .and_then(|v| v.get("mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let sticky_hit = route
+        .get("stickyHit")
+        .is_some_and(|v| v.as_bool() == Some(true) || v.as_i64() == Some(1));
+    let session_id = route
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .or_else(|| route.get("stickyId").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let session_source = route
+        .get("sessionSource")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    (true, sticky_hit, vision_mode, session_id, session_source)
+}
+
+fn process_meta(attempts: i64, attempt_details_json: &str, attempt_details: &[AttemptDetail]) -> (bool, i64) {
+    let has_retry_in_json = attempt_details_json.contains("\"retries\":[{");
+    let has_notice_in_json = attempt_details_json.contains("\"notice\":\"");
+    let has_process_facts = attempts > 1 || has_retry_in_json || has_notice_in_json;
+    let internal_retries = if attempts <= 1 && has_retry_in_json {
+        attempt_details.first().map(|a| a.retries.len() as i64).unwrap_or(0)
+    } else {
+        0
+    };
+    (has_process_facts, internal_retries)
+}
+
+fn build_detail_meta(
+    route: &Value,
+    attempts: i64,
+    attempt_details_json: &str,
+    attempt_details: &[AttemptDetail],
+    has_sensitive_hits: bool,
+    evidence: Option<&ClientEvidence>,
+) -> DetailMeta {
+    let (has_route, sticky_hit, vision_mode, session_id, session_source) = route_meta(route);
+    let (has_process_facts, internal_retries) = process_meta(attempts, attempt_details_json, attempt_details);
+    let has_client_evidence = evidence.is_some_and(|e| !e.method.is_empty());
+    let recorded_client_name = evidence.map(|e| e.client_name.clone()).unwrap_or_default();
+    let client_user_agent = evidence.map(|e| e.user_agent.clone()).unwrap_or_default();
+
+    let mut flags = FLAG_DETAILS_SPLIT;
+    if has_route { flags |= FLAG_HAS_ROUTE; }
+    if has_sensitive_hits { flags |= FLAG_HAS_SENSITIVE_HITS; }
+    if has_process_facts { flags |= FLAG_HAS_PROCESS_FACTS; }
+    if has_client_evidence { flags |= FLAG_HAS_CLIENT_EVIDENCE; }
+    if sticky_hit { flags |= FLAG_STICKY_HIT; }
+
+    DetailMeta {
+        flags,
+        internal_retries,
+        vision_mode,
+        recorded_client_name,
+        client_user_agent,
+        session_id,
+        session_source,
+    }
+}
+
+pub(super) const REQUEST_DETAILS_JOIN: &str =
+    "requests r LEFT JOIN request_details d ON d.row_id = r.row_id";
+
+/// 完整明细列顺序（所有完整 SELECT 都按这个顺序取，`decode_request` 依赖它；
+/// 优先从冷详情表 `request_details` 读取已拆分的条目，未拆分历史行自动回退 `requests` 原列）。
+pub(super) const REQUEST_JOIN_COLUMNS: &str = "r.id, r.ts, r.model, r.account_id, r.account_name, r.status, r.duration_ms, \
+     r.first_response_ms, r.attempts, r.error, r.prompt_tokens, r.completion_tokens, r.total_tokens, \
+     r.cache_read_tokens, r.provider, r.client_model, r.upstream_model, \
+     CASE WHEN (r.detail_flags & 32) <> 0 THEN COALESCE(d.attempt_details, '[]') ELSE r.attempt_details END, \
+     CASE WHEN (r.detail_flags & 32) <> 0 THEN COALESCE(d.sensitive_hits, '[]') ELSE r.sensitive_hits END, \
+     r.client_reasoning, r.upstream_reasoning, r.phase, r.phase_started_at, r.is_test, \
+     CASE WHEN (r.detail_flags & 32) <> 0 THEN d.route ELSE r.route END, \
+     r.client, r.api_key_id, r.api_key_name, r.api_key_source, r.credit, \
+     CASE WHEN (r.detail_flags & 32) <> 0 THEN COALESCE(d.client_evidence, '{}') ELSE r.client_evidence END";
+
+/// 列表页轻量查询列：新写入行直接读取预计算标量列，彻底避免大 JSON 扫描与解析；历史行自动回退旧 SQL 表达式。
 pub(super) const REQUEST_LIST_SELECT: &str = "row_id, id, ts, model, account_id, account_name, status, \
      duration_ms, first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, client_reasoning, upstream_reasoning, \
      phase, phase_started_at, is_test, client, api_key_id, api_key_name, api_key_source, credit, \
-     CASE WHEN route IS NOT NULL THEN 1 ELSE 0 END AS has_route, \
-     CASE WHEN route IS NOT NULL AND instr(route, 'visionCompatibility') > 0 AND json_valid(route) \
+     CASE WHEN (detail_flags & 32) <> 0 THEN (detail_flags & 1) <> 0 ELSE (route IS NOT NULL) END AS has_route, \
+     CASE WHEN (detail_flags & 32) <> 0 THEN vision_mode \
+          WHEN route IS NOT NULL AND instr(route, 'visionCompatibility') > 0 AND json_valid(route) \
           THEN COALESCE(json_extract(route, '$.visionCompatibility.mode'), '') ELSE '' END AS vision_mode, \
-     CASE WHEN sensitive_hits <> '' AND sensitive_hits <> '[]' THEN 1 ELSE 0 END AS has_sensitive_hits, \
-     CASE WHEN attempts > 1 OR (attempt_details <> '' AND attempt_details <> '[]' \
+     CASE WHEN (detail_flags & 32) <> 0 THEN (detail_flags & 2) <> 0 \
+          ELSE (sensitive_hits <> '' AND sensitive_hits <> '[]') END AS has_sensitive_hits, \
+     CASE WHEN (detail_flags & 32) <> 0 THEN (detail_flags & 4) <> 0 \
+          WHEN attempts > 1 OR (attempt_details <> '' AND attempt_details <> '[]' \
           AND (instr(attempt_details, '\"retries\":[{') > 0 OR instr(attempt_details, '\"notice\":\"') > 0)) \
           THEN 1 ELSE 0 END AS has_process_facts, \
-     CASE WHEN attempts <= 1 AND attempt_details <> '' AND attempt_details <> '[]' \
+     CASE WHEN (detail_flags & 32) <> 0 THEN internal_retries \
+          WHEN attempts <= 1 AND attempt_details <> '' AND attempt_details <> '[]' \
           AND instr(attempt_details, '\"retries\":[{') > 0 AND json_valid(attempt_details) \
           THEN COALESCE(json_array_length(json_extract(attempt_details, '$[0].retries')), 0) ELSE 0 END AS internal_retries, \
-     CASE WHEN client_evidence <> '' AND client_evidence <> '{}' AND json_valid(client_evidence) \
+     CASE WHEN (detail_flags & 32) <> 0 THEN (detail_flags & 8) <> 0 \
+          WHEN client_evidence <> '' AND client_evidence <> '{}' AND json_valid(client_evidence) \
           AND COALESCE(json_extract(client_evidence, '$.method'), '') <> '' THEN 1 ELSE 0 END AS has_client_evidence, \
-     CASE WHEN client_evidence <> '' AND client_evidence <> '{}' AND json_valid(client_evidence) \
+     CASE WHEN (detail_flags & 32) <> 0 THEN recorded_client_name \
+          WHEN client_evidence <> '' AND client_evidence <> '{}' AND json_valid(client_evidence) \
           THEN COALESCE(json_extract(client_evidence, '$.clientName'), '') ELSE '' END AS recorded_client_name, \
-     CASE WHEN client_evidence <> '' AND client_evidence <> '{}' AND json_valid(client_evidence) \
+     CASE WHEN (detail_flags & 32) <> 0 THEN client_user_agent \
+          WHEN client_evidence <> '' AND client_evidence <> '{}' AND json_valid(client_evidence) \
           THEN COALESCE(json_extract(client_evidence, '$.userAgent'), '') ELSE '' END AS client_user_agent";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
@@ -506,8 +602,10 @@ fn select_distinct_ordered(
 
 pub(super) fn source_filter_options(conn: &Connection, max: usize) -> rusqlite::Result<Value> {
     let mut client_stmt = conn.prepare(
-        "SELECT grouped.client, CASE WHEN json_valid(r.client_evidence) \
-         THEN COALESCE(json_extract(r.client_evidence, '$.clientName'), '') ELSE '' END \
+        "SELECT grouped.client, \
+         CASE WHEN (r.detail_flags & 32) <> 0 THEN r.recorded_client_name \
+              WHEN json_valid(r.client_evidence) THEN COALESCE(json_extract(r.client_evidence, '$.clientName'), '') \
+              ELSE '' END \
          FROM (SELECT client, MAX(row_id) AS latest, COUNT(*) AS n FROM requests \
          GROUP BY client ORDER BY n DESC, client LIMIT ?1) grouped \
          JOIN requests r ON r.row_id = grouped.latest ORDER BY grouped.n DESC, grouped.client",
@@ -571,7 +669,7 @@ pub(super) fn select_page_desc(
     limit: usize,
 ) -> rusqlite::Result<Vec<RequestEntry>> {
     let sql = format!(
-        "SELECT {REQUEST_COLUMNS} FROM requests{} ORDER BY ts DESC, row_id DESC LIMIT ? OFFSET ?",
+        "SELECT {REQUEST_JOIN_COLUMNS} FROM {REQUEST_DETAILS_JOIN}{} ORDER BY r.ts DESC, r.row_id DESC LIMIT ? OFFSET ?",
         plan.where_sql
     );
     let mut binds = plan.binds.clone();
@@ -612,7 +710,9 @@ pub(super) fn select_detail_by_row_id(
     conn: &Connection,
     row_id: i64,
 ) -> rusqlite::Result<Option<(i64, RequestEntry)>> {
-    let sql = format!("SELECT {REQUEST_COLUMNS}, row_id FROM requests WHERE row_id = ?1 LIMIT 1");
+    let sql = format!(
+        "SELECT {REQUEST_JOIN_COLUMNS}, r.row_id FROM {REQUEST_DETAILS_JOIN} WHERE r.row_id = ?1 LIMIT 1"
+    );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params![row_id])?;
     let Some(row) = rows.next()? else { return Ok(None); };
@@ -625,8 +725,9 @@ pub(super) fn select_detail_by_id(
     ts: Option<i64>,
 ) -> rusqlite::Result<Option<(i64, RequestEntry)>> {
     let sql = format!(
-        "SELECT {REQUEST_COLUMNS}, row_id FROM requests WHERE id = ?1 AND (?2 IS NULL OR ts = ?2) \
-         ORDER BY (status = 0) DESC, ts DESC, row_id DESC LIMIT 1"
+        "SELECT {REQUEST_JOIN_COLUMNS}, r.row_id FROM {REQUEST_DETAILS_JOIN} \
+         WHERE r.id = ?1 AND (?2 IS NULL OR r.ts = ?2) \
+         ORDER BY (r.status = 0) DESC, r.ts DESC, r.row_id DESC LIMIT 1"
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params![id, ts])?;
@@ -655,10 +756,10 @@ pub(super) fn select_between(
 ) -> rusqlite::Result<Vec<RequestEntry>> {
     // 条件拼在这里而不是拆成两条 SQL：两条 SQL 迟早会漂（一处改了排序、
     // 另一处忘了），而它们的差异只有一个布尔条件
-    let filter = if exclude_tests { " AND is_test = 0" } else { "" };
+    let filter = if exclude_tests { " AND r.is_test = 0" } else { "" };
     let sql = format!(
-        "SELECT {REQUEST_COLUMNS} FROM requests WHERE ts >= ?1 AND ts <= ?2{filter} \
-         ORDER BY ts ASC, row_id ASC"
+        "SELECT {REQUEST_JOIN_COLUMNS} FROM {REQUEST_DETAILS_JOIN} \
+         WHERE r.ts >= ?1 AND r.ts <= ?2{filter} ORDER BY r.ts ASC, r.row_id ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params![from_ms, to_ms])?;
@@ -689,6 +790,35 @@ pub(super) fn select_between(
 /// `phase='connecting'`）逐字同法。
 ///
 /// 返回是否真的插入了新行（调用方目前不需要区分，但测试与日志可能想看）。
+fn upsert_request_details(
+    conn: &Connection,
+    row_id: i64,
+    route: Option<&str>,
+    attempt_details: &str,
+    sensitive_hits: &str,
+    client_evidence: &str,
+) -> rusqlite::Result<()> {
+    if route.is_none()
+        && attempt_details == "[]"
+        && sensitive_hits == "[]"
+        && client_evidence == "{}"
+    {
+        conn.execute("DELETE FROM request_details WHERE row_id = ?1", params![row_id])?;
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO request_details (row_id, route, attempt_details, sensitive_hits, client_evidence) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(row_id) DO UPDATE SET \
+           route = excluded.route, \
+           attempt_details = excluded.attempt_details, \
+           sensitive_hits = excluded.sensitive_hits, \
+           client_evidence = excluded.client_evidence",
+        params![row_id, route, attempt_details, sensitive_hits, client_evidence],
+    )?;
+    Ok(())
+}
+
 pub(super) fn insert_started_request(
     conn: &Connection,
     id: &str,
@@ -707,38 +837,65 @@ pub(super) fn insert_started_request(
     if existing > 0 {
         return Ok(false);
     }
-    // client_reasoning 随首发写入：下游等级在请求开始时就定稿了（与 client_model
-    // 同一时刻、同一来源），进行中行就能显示「请求的什么(等级)」
-    // is_test 同样随首发写入：来源是入口就知道的事实，等收尾再补会让「进行中」
-    // 那一段的测试行看起来与真实流量一样
-    // client（来源客户端）同一理由：它在入口解析请求头那一刻就定稿了，
-    // 进行中行也应带上 —— 等收尾再补会让列表里「客户端」列在转发期间空一格
+    let evidence_json = source.evidence_json();
+    let has_evidence = source
+        .evidence
+        .as_ref()
+        .is_some_and(|e| !e.method.is_empty());
+    let detail_flags = FLAG_DETAILS_SPLIT | if has_evidence { FLAG_HAS_CLIENT_EVIDENCE } else { 0 };
+    let recorded_client_name = source
+        .evidence
+        .as_ref()
+        .map(|e| e.client_name.as_str())
+        .unwrap_or("");
+    let client_user_agent = source
+        .evidence
+        .as_ref()
+        .map(|e| e.user_agent.as_str())
+        .unwrap_or("");
     conn.execute(
         "INSERT INTO requests (id, ts, model, client_model, client_reasoning, status, \
-         phase, phase_started_at, is_test, client, api_key_id, api_key_name, api_key_source, client_evidence) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![id, ts, model, client_model, client_reasoning, is_test as i64,
-            source.client, source.api_key.id, source.api_key.name, source.api_key.source, source.evidence_json()],
+         phase, phase_started_at, is_test, client, api_key_id, api_key_name, api_key_source, \
+         client_evidence, detail_flags, recorded_client_name, client_user_agent) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6, ?7, ?8, ?9, ?10, '{}', ?11, ?12, ?13)",
+        params![
+            id,
+            ts,
+            model,
+            client_model,
+            client_reasoning,
+            is_test as i64,
+            source.client,
+            source.api_key.id,
+            source.api_key.name,
+            source.api_key.source,
+            detail_flags,
+            recorded_client_name,
+            client_user_agent,
+        ],
     )?;
+    let row_id = conn.last_insert_rowid();
+    if evidence_json != "{}" {
+        upsert_request_details(conn, row_id, None, "[]", "[]", &evidence_json)?;
+    }
     Ok(true)
 }
 
-/// 收尾**陈旧的进行中行**：status=0 且开始时刻早于 cutoff 的行没有机会再收到
-/// 收尾 UPDATE（进程崩溃 / 流任务泄漏），把它就地补一个明确的失败终态。
-///
-/// 为什么是「补终态」而不是删除：界面上的进行中 → 结束是用户会一直盯着看的状态
-/// 流转。删掉一行等于让请求凭空消失，用户会以为平台漏记；补 408 则如实回答
-/// 「这次没跑完」。OmniProxy 的 `applyInterruptedLogs`（requestLogLifecycle.ts）
-/// 走的是同一条语义。`duration_ms` 与 `ts` 一并补齐，避免列出 0 耗时的假象。
 pub(super) fn finish_stale_running(
     conn: &Connection,
     cutoff: i64,
     now: i64,
 ) -> rusqlite::Result<usize> {
     conn.execute(
+        "UPDATE request_details SET attempt_details = '[]', sensitive_hits = '[]' \
+         WHERE row_id IN (SELECT row_id FROM requests WHERE status = 0 AND ts < ?1)",
+        params![cutoff],
+    )?;
+    conn.execute(
         "UPDATE requests SET status = 408, error = '网关重启或流中断，请求未能完成', \
          duration_ms = MAX(?2 - ts, 0), attempts = 1, \
-         attempt_details = '[]', sensitive_hits = '[]', phase = '', phase_started_at = NULL \
+         attempt_details = '[]', sensitive_hits = '[]', phase = '', phase_started_at = NULL, \
+         detail_flags = detail_flags & ~6, internal_retries = 0 \
          WHERE status = 0 AND ts < ?1",
         params![cutoff, now],
     )
@@ -799,27 +956,129 @@ pub(super) fn update_running_progress(
     id: &str,
     progress: &RunningProgress,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE requests SET provider = ?2, account_id = ?3, account_name = ?4, \
-         upstream_model = ?5, upstream_reasoning = ?6, attempts = ?7, first_response_ms = ?8, \
-         attempt_details = ?9, sensitive_hits = ?10, phase = ?11, phase_started_at = ?12, \
-         route = COALESCE(?13, route) WHERE id = ?1 AND status = 0",
-        params![
-            id,
-            progress.provider,
-            progress.account_id,
-            progress.account_name,
-            progress.upstream_model,
-            progress.upstream_reasoning,
-            progress.attempts,
-            progress.first_response_ms,
-            encode_json_list(&progress.attempt_details),
-            encode_json_list(&progress.sensitive_hits),
-            progress.phase,
-            progress.phase_started_at,
-            progress.route.as_ref().map(Value::to_string),
-        ],
-    )
+    if id.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT r.row_id, r.detail_flags, r.vision_mode, r.session_id, r.session_source, \
+                r.recorded_client_name, r.client_user_agent, \
+                CASE WHEN (r.detail_flags & 32) <> 0 THEN COALESCE(d.client_evidence, '{}') ELSE r.client_evidence END, \
+                CASE WHEN (r.detail_flags & 32) <> 0 THEN d.route ELSE r.route END \
+         FROM requests r \
+         LEFT JOIN request_details d ON d.row_id = r.row_id \
+         WHERE r.id = ?1 AND r.status = 0",
+    )?;
+    let targets = stmt
+        .query_map(params![id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if targets.is_empty() {
+        return Ok(0);
+    }
+
+    let attempt_details_json = encode_json_list(&progress.attempt_details);
+    let sensitive_hits_json = encode_json_list(&progress.sensitive_hits);
+    let route_json = progress.route.as_ref().map(Value::to_string);
+    let (has_process_facts, internal_retries) =
+        process_meta(progress.attempts, &attempt_details_json, &progress.attempt_details);
+    let has_sensitive_hits = !progress.sensitive_hits.is_empty();
+
+    let mut updated = 0usize;
+    for (
+        row_id,
+        old_flags,
+        old_vision_mode,
+        old_session_id,
+        old_session_source,
+        mut recorded_client_name,
+        mut client_user_agent,
+        existing_evidence,
+        existing_route,
+    ) in targets
+    {
+        let (has_client_evidence, ev_name, ev_ua) = if (old_flags & FLAG_DETAILS_SPLIT) != 0 {
+            ((old_flags & FLAG_HAS_CLIENT_EVIDENCE) != 0, recorded_client_name.clone(), client_user_agent.clone())
+        } else if let Ok(ev) = serde_json::from_str::<ClientEvidence>(&existing_evidence) {
+            (!ev.method.is_empty(), ev.client_name, ev.user_agent)
+        } else {
+            (false, String::new(), String::new())
+        };
+        recorded_client_name = ev_name;
+        client_user_agent = ev_ua;
+
+        let effective_route_json = route_json.clone().or(existing_route);
+        let (has_route, sticky_hit, vision_mode, session_id, session_source) = match &progress.route {
+            Some(route) => route_meta(route),
+            None if (old_flags & FLAG_DETAILS_SPLIT) != 0 => (
+                (old_flags & FLAG_HAS_ROUTE) != 0,
+                (old_flags & FLAG_STICKY_HIT) != 0,
+                old_vision_mode,
+                old_session_id,
+                old_session_source,
+            ),
+            None => effective_route_json
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .map_or((false, false, String::new(), String::new(), String::new()), |v| route_meta(&v)),
+        };
+
+        let mut flags = FLAG_DETAILS_SPLIT;
+        if has_route { flags |= FLAG_HAS_ROUTE; }
+        if has_sensitive_hits { flags |= FLAG_HAS_SENSITIVE_HITS; }
+        if has_process_facts { flags |= FLAG_HAS_PROCESS_FACTS; }
+        if has_client_evidence { flags |= FLAG_HAS_CLIENT_EVIDENCE; }
+        if sticky_hit { flags |= FLAG_STICKY_HIT; }
+
+        updated += conn.execute(
+            "UPDATE requests SET provider = ?2, account_id = ?3, account_name = ?4, \
+             upstream_model = ?5, upstream_reasoning = ?6, attempts = ?7, first_response_ms = ?8, \
+             attempt_details = '[]', sensitive_hits = '[]', phase = ?9, phase_started_at = ?10, \
+             route = NULL, client_evidence = '{}', detail_flags = ?11, internal_retries = ?12, \
+             vision_mode = ?13, recorded_client_name = ?14, client_user_agent = ?15, \
+             session_id = ?16, session_source = ?17 \
+             WHERE row_id = ?1 AND status = 0",
+            params![
+                row_id,
+                progress.provider,
+                progress.account_id,
+                progress.account_name,
+                progress.upstream_model,
+                progress.upstream_reasoning,
+                progress.attempts,
+                progress.first_response_ms,
+                progress.phase,
+                progress.phase_started_at,
+                flags,
+                internal_retries,
+                vision_mode,
+                recorded_client_name,
+                client_user_agent,
+                session_id,
+                session_source,
+            ],
+        )?;
+        upsert_request_details(
+            conn,
+            row_id,
+            effective_route_json.as_deref(),
+            &attempt_details_json,
+            &sensitive_hits_json,
+            &existing_evidence,
+        )?;
+    }
+    Ok(updated)
 }
 
 /// 收尾一条进行中的明细：按 `id + status=0` 匹配，**补齐全部终态字段**。
@@ -844,14 +1103,41 @@ pub(super) fn update_running_request(
     if entry.id.is_empty() {
         return Ok(0);
     }
-    conn.execute(
+    let mut stmt = conn.prepare("SELECT row_id FROM requests WHERE id = ?1 AND status = 0")?;
+    let row_ids = stmt
+        .query_map(params![entry.id], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if row_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let attempt_details_json = encode_json_list(&entry.attempt_details);
+    let sensitive_hits_json = encode_json_list(&entry.sensitive_hits);
+    let route_json = match encode_optional_json(&entry.route) {
+        SqlValue::Text(s) => Some(s),
+        _ => None,
+    };
+    let evidence_json = entry.source.evidence_json();
+    let meta = build_detail_meta(
+        &entry.route,
+        entry.attempts,
+        &attempt_details_json,
+        &entry.attempt_details,
+        !entry.sensitive_hits.is_empty(),
+        entry.source.evidence.as_ref(),
+    );
+
+    let updated = conn.execute(
         "UPDATE requests SET ts = ?2, model = ?3, account_id = ?4, account_name = ?5, status = ?6, \
          duration_ms = ?7, first_response_ms = ?8, attempts = ?9, error = ?10, prompt_tokens = ?11, \
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
-         client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
-         client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
-         is_test = ?22, route = ?23, client = ?24, \
-         api_key_id = ?25, api_key_name = ?26, api_key_source = ?27, credit = ?28, client_evidence = ?29 \
+         client_model = ?16, upstream_model = ?17, attempt_details = '[]', sensitive_hits = '[]', \
+         client_reasoning = ?18, upstream_reasoning = ?19, phase = '', phase_started_at = NULL, \
+         is_test = ?20, route = NULL, client = ?21, \
+         api_key_id = ?22, api_key_name = ?23, api_key_source = ?24, credit = ?25, client_evidence = '{}', \
+         detail_flags = ?26, internal_retries = ?27, vision_mode = ?28, \
+         recorded_client_name = ?29, client_user_agent = ?30, session_id = ?31, session_source = ?32 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -871,24 +1157,36 @@ pub(super) fn update_running_request(
             entry.provider,
             entry.client_model,
             entry.upstream_model,
-            encode_json_list(&entry.attempt_details),
-            encode_json_list(&entry.sensitive_hits),
             entry.client_reasoning,
             entry.upstream_reasoning,
-            // 来源标记收尾时**再写一次**（而不是只在首发时写）：这条 UPDATE 是
-            // 无进行中行时的兜底之外的主路径，写一次保证两条插入路径口径一致
             entry.is_test as i64,
-            encode_optional_json(&entry.route),
-            // 客户端同 is_test：首发已写过一次，收尾再写一次保证
-            // 「有进行中行」与「直接插入」两条路径落库的值同源
             entry.source.client,
             entry.source.api_key.id,
             entry.source.api_key.name,
             entry.source.api_key.source,
             entry.credit,
-            entry.source.evidence_json(),
+            meta.flags,
+            meta.internal_retries,
+            meta.vision_mode,
+            meta.recorded_client_name,
+            meta.client_user_agent,
+            meta.session_id,
+            meta.session_source,
         ],
-    )
+    )?;
+    if updated > 0 {
+        for row_id in row_ids {
+            upsert_request_details(
+                conn,
+                row_id,
+                route_json.as_deref(),
+                &attempt_details_json,
+                &sensitive_hits_json,
+                &evidence_json,
+            )?;
+        }
+    }
+    Ok(updated)
 }
 
 pub(super) fn terminal_record_exists(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
@@ -899,23 +1197,34 @@ pub(super) fn terminal_record_exists(conn: &Connection, id: &str) -> rusqlite::R
     )
 }
 
-/// 插入一条明细（`row_id` 由库自增，调用方不必也不该给）
-///
-/// 末尾两个 JSON 列由 [`encode_json_list`] 编码；空表写成 `'[]'`，与 DDL 的
-/// 默认值同形（于是「没有数据」在库里只有一种表示，读侧不必分「NULL 还是空数组」）。
-///
-/// **两个阶段列不在这里写**：终态行的阶段恒为空（见 `RequestEntry::phase`），
-/// 而 DDL 的默认值（`''` / `NULL`）就是那个值 —— 走 DEFAULT 比显式写一遍更不容易
-/// 漂移（写入侧将来加字段时不会漏掉这两列）。
 pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlite::Result<()> {
+    let attempt_details_json = encode_json_list(&entry.attempt_details);
+    let sensitive_hits_json = encode_json_list(&entry.sensitive_hits);
+    let route_json = match encode_optional_json(&entry.route) {
+        SqlValue::Text(s) => Some(s),
+        _ => None,
+    };
+    let evidence_json = entry.source.evidence_json();
+    let meta = build_detail_meta(
+        &entry.route,
+        entry.attempts,
+        &attempt_details_json,
+        &entry.attempt_details,
+        !entry.sensitive_hits.is_empty(),
+        entry.source.evidence.as_ref(),
+    );
+
     conn.execute(
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
          sensitive_hits, client_reasoning, upstream_reasoning, is_test, route, client, \
-         api_key_id, api_key_name, api_key_source, credit, client_evidence) \
+         api_key_id, api_key_name, api_key_source, credit, client_evidence, \
+         detail_flags, internal_retries, vision_mode, recorded_client_name, client_user_agent, \
+         session_id, session_source) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+         '[]', '[]', ?18, ?19, ?20, NULL, ?21, ?22, ?23, ?24, ?25, '{}', \
+         ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
         params![
             entry.id,
             entry.ts,
@@ -934,19 +1243,31 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.provider,
             entry.client_model,
             entry.upstream_model,
-            encode_json_list(&entry.attempt_details),
-            encode_json_list(&entry.sensitive_hits),
             entry.client_reasoning,
             entry.upstream_reasoning,
             entry.is_test as i64,
-            encode_optional_json(&entry.route),
             entry.source.client,
             entry.source.api_key.id,
             entry.source.api_key.name,
             entry.source.api_key.source,
             entry.credit,
-            entry.source.evidence_json(),
+            meta.flags,
+            meta.internal_retries,
+            meta.vision_mode,
+            meta.recorded_client_name,
+            meta.client_user_agent,
+            meta.session_id,
+            meta.session_source,
         ],
+    )?;
+    let row_id = conn.last_insert_rowid();
+    upsert_request_details(
+        conn,
+        row_id,
+        route_json.as_deref(),
+        &attempt_details_json,
+        &sensitive_hits_json,
+        &evidence_json,
     )?;
     Ok(())
 }
@@ -967,6 +1288,7 @@ pub(super) fn delete_matching(
 /// 清空全部明细。调用方必须先在同一事务中清理两侧报文。
 pub(super) fn delete_all_requests(conn: &Connection) -> rusqlite::Result<usize> {
     crate::server::db::invalidate_query_caches();
+    conn.execute("DELETE FROM request_details", [])?;
     conn.execute("DELETE FROM requests", [])
 }
 

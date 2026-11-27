@@ -405,7 +405,7 @@ fn schema_v31_query_plans_use_targeted_covering_indexes() {
         ..Default::default()
     });
 
-    let (eqp_running, eqp_error, eqp_provider, eqp_summary_rows, eqp_cache_windows) = stats
+    let (eqp_running, eqp_error, eqp_error_page, eqp_provider, eqp_summary_rows, eqp_cache_windows) = stats
         .with_read_conn(|conn| {
             let eqp_running = explain(
                 conn,
@@ -418,6 +418,14 @@ fn schema_v31_query_plans_use_targeted_covering_indexes() {
             let eqp_error = explain(
                 conn,
                 &format!("SELECT COUNT(*) FROM requests{}", error_plan.where_sql_for_test()),
+                error_plan.binds_for_test(),
+            );
+            let eqp_error_page = explain(
+                conn,
+                &format!(
+                    "SELECT row_id FROM requests{} ORDER BY ts DESC, row_id DESC LIMIT 50",
+                    error_plan.where_sql_for_test()
+                ),
                 error_plan.binds_for_test(),
             );
             let eqp_provider = explain(
@@ -453,6 +461,7 @@ fn schema_v31_query_plans_use_targeted_covering_indexes() {
             Ok((
                 eqp_running,
                 eqp_error,
+                eqp_error_page,
                 eqp_provider,
                 eqp_summary_rows,
                 eqp_cache_windows,
@@ -465,8 +474,12 @@ fn schema_v31_query_plans_use_targeted_covering_indexes() {
         "running plan: {eqp_running}"
     );
     assert!(
-        eqp_error.contains("idx_requests_errors_ts"),
+        eqp_error.contains("COVERING INDEX idx_requests_errors_ts"),
         "error plan: {eqp_error}"
+    );
+    assert!(
+        eqp_error_page.contains("idx_requests_errors_ts") && !eqp_error_page.contains("TEMP B-TREE"),
+        "error page plan: {eqp_error_page}"
     );
     assert!(
         eqp_provider.contains("idx_requests_provider_ts") && !eqp_provider.contains("TEMP B-TREE"),
@@ -546,4 +559,186 @@ fn source_filter_options_formats_all_key_sources_accurately() {
     assert_eq!(map.get("env").copied(), Some("环境变量 Key"));
     assert_eq!(map.get("none").copied(), Some("免鉴权调用"));
     assert_eq!(map.get("unknown").copied(), Some("历史未记录 Key"));
+}
+
+#[test]
+fn cold_json_is_stored_in_request_details_and_deleted_by_trigger() {
+    use super::record::{AttemptDetail, RetryEvent, SensitiveHit};
+    use crate::server::core::client::ClientEvidence;
+    use super::flow::FlowQuery;
+
+    let (_dir, stats) = temp_stats();
+    let now = crate::server::logging::now_ms();
+    let mut item = entry("split-1", now);
+    item.attempts = 1;
+    item.route = json!({
+        "stickyHit": true,
+        "sessionId": "sess-1",
+        "sessionSource": "cookie",
+        "visionCompatibility": { "mode": "strip" }
+    });
+    item.attempt_details = vec![AttemptDetail {
+        provider: "test-provider".into(),
+        account: "acc".into(),
+        account_id: "acc-1".into(),
+        candidate_id: String::new(),
+        member_id: String::new(),
+        model: "wire-model".into(),
+        reasoning: String::new(),
+        reason: "ok".into(),
+        sticky_hit: true,
+        started_at: Some(now),
+        response_at: Some(now + 5),
+        finished_at: Some(now + 10),
+        status: Some(200),
+        error: None,
+        retries: vec![RetryEvent {
+            reason: "429".into(),
+            status: Some(429),
+            delay_ms: 100,
+        }],
+        notice: None,
+        body_bytes: Some(42),
+        error_policy: None,
+    }];
+    item.sensitive_hits = vec![SensitiveHit {
+        word: "secret-rule".into(),
+        count: 2,
+    }];
+    item.source.evidence = Some(ClientEvidence {
+        method: "header".into(),
+        client_name: "Codex CLI".into(),
+        user_agent: "codex/1.0".into(),
+        ..Default::default()
+    });
+    stats.record(item);
+
+    // 1. 主表冷 JSON 列必须为极小占位值，热标量与 request_details 必须落库
+    let (main_row, detail_row) = stats
+        .with_read_conn(|conn| {
+            let main_row: (Option<String>, String, String, String, i64, i64, String, String, String, String, String) = conn.query_row(
+                "SELECT route, attempt_details, sensitive_hits, client_evidence, detail_flags, internal_retries, \
+                        vision_mode, recorded_client_name, client_user_agent, session_id, session_source \
+                 FROM requests WHERE id = 'split-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
+            )?;
+            let detail_row: (Option<String>, String, String, String) = conn.query_row(
+                "SELECT route, attempt_details, sensitive_hits, client_evidence FROM request_details",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            Ok((main_row, detail_row))
+        })
+        .unwrap();
+
+    assert_eq!(main_row.0, None);
+    assert_eq!(main_row.1, "[]");
+    assert_eq!(main_row.2, "[]");
+    assert_eq!(main_row.3, "{}");
+    assert_ne!(main_row.4 & super::sql::FLAG_DETAILS_SPLIT, 0);
+    assert_eq!(main_row.5, 1);
+    assert_eq!(main_row.6, "strip");
+    assert_eq!(main_row.7, "Codex CLI");
+    assert_eq!(main_row.8, "codex/1.0");
+    assert_eq!(main_row.9, "sess-1");
+    assert_eq!(main_row.10, "cookie");
+    assert!(detail_row.0.unwrap().contains("sess-1"));
+    assert!(detail_row.1.contains("429"));
+    assert!(detail_row.2.contains("secret-rule"));
+    assert!(detail_row.3.contains("Codex CLI"));
+
+    // 2. list_only 列表响应零回表返回所有派生标记
+    let list_page = stats.query_requests(&RequestQuery {
+        list_only: true,
+        ..Default::default()
+    });
+    let row = &list_page["entries"][0];
+    assert_eq!(row["hasRoute"], true);
+    assert_eq!(row["visionMode"], "strip");
+    assert_eq!(row["hasSensitiveHits"], true);
+    assert_eq!(row["hasProcessFacts"], true);
+    assert_eq!(row["internalRetries"], 1);
+    assert_eq!(row["hasClientEvidence"], true);
+    assert_eq!(row["clientLabel"], "Codex CLI");
+    assert_eq!(row["clientUserAgent"], "codex/1.0");
+
+    // 3. 详情与完整页、flow/trace/replays 均能还原冷表
+    let detail = stats.request_detail(row["rowId"].as_i64(), None, None).unwrap();
+    assert_eq!(detail["route"]["sessionId"], "sess-1");
+    assert_eq!(detail["attemptDetails"][0]["retries"][0]["reason"], "429");
+    assert_eq!(detail["sensitiveHits"][0]["word"], "secret-rule");
+    assert_eq!(detail["clientEvidence"]["method"], "header");
+
+    let replays = stats.routing_replays(None, 0, 10, "sticky");
+    assert_eq!(replays["matched"], 1);
+    let trace = stats.routing_trace(None, 0, 10, "sticky", "", None);
+    assert_eq!(trace["matched"], 1);
+    let flow = stats.routing_flow(
+        &FlowQuery {
+            model: String::new(),
+            minutes: 60,
+            running_only: false,
+            search: String::new(),
+            session_search: String::new(),
+            path: String::new(),
+            session: String::new(),
+            client: None,
+            provider: String::new(),
+            account: String::new(),
+            activity: String::new(),
+            offset: 0,
+            limit: 20,
+        },
+        None,
+    );
+    assert_eq!(flow["paths"][0]["stickyHits"], 1);
+
+    // 4. 删除 requests 行时触发器必须同步级联清理 request_details
+    stats.clear_requests(
+        &RequestQuery {
+            provider: Some("test-provider".into()),
+            ..Default::default()
+        },
+        false,
+    );
+    let remaining_details: i64 = stats
+        .with_read_conn(|conn| conn.query_row("SELECT COUNT(*) FROM request_details", [], |r| r.get(0)))
+        .unwrap();
+    assert_eq!(remaining_details, 0);
+}
+
+#[test]
+fn legacy_inline_rows_still_decode_for_list_and_detail() {
+    let (_dir, stats) = temp_stats();
+    let now = crate::server::logging::now_ms();
+    let guard = stats.guard();
+    stats
+        .with_conn_mut(&guard, |conn| {
+            conn.execute(
+                "INSERT INTO requests (id, ts, model, status, duration_ms, attempts, provider, route, client, client_evidence, detail_flags) \
+                 VALUES ('legacy-1', ?1, 'm', 200, 10, 1, 'p', '{\"stickyHit\":true,\"visionCompatibility\":{\"mode\":\"assist_call\"}}', \
+                 'zcode', '{\"method\":\"ua\",\"clientName\":\"Legacy Client\",\"userAgent\":\"legacy/1.0\"}', 0)",
+                rusqlite::params![now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    drop(guard);
+
+    let list_page = stats.query_requests(&RequestQuery {
+        list_only: true,
+        ..Default::default()
+    });
+    let row = &list_page["entries"][0];
+    assert_eq!(row["id"], "legacy-1");
+    assert_eq!(row["hasRoute"], true);
+    assert_eq!(row["visionMode"], "assist_call");
+    assert_eq!(row["hasClientEvidence"], true);
+    assert_eq!(row["clientLabel"], "Legacy Client");
+    assert_eq!(row["clientUserAgent"], "legacy/1.0");
+
+    let detail = stats.request_detail(row["rowId"].as_i64(), None, None).unwrap();
+    assert_eq!(detail["route"]["stickyHit"], true);
+    assert_eq!(detail["clientEvidence"]["clientName"], "Legacy Client");
 }

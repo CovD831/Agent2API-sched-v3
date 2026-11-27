@@ -1,8 +1,9 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{Datelike, Duration, Local, TimeZone};
-use rusqlite::params;
+use rusqlite::{params, params_from_iter};
 
 use crate::server::{db::Db, logging};
 
@@ -226,38 +227,163 @@ fn refresh_inner(accounts: &[serde_json::Value], replace: bool) {
             }
         }
     }
-    let mut slot = match slot().lock() { Ok(slot) => slot, Err(_) => return };
-    let fresh = db.with(|conn| -> rusqlite::Result<Facts> {
-        let watermark: i64 = conn.query_row("SELECT COALESCE(MAX(row_id), 0) FROM account_limiter_events", [], |row| row.get(0))?;
-        let mut facts = Facts::new();
-        let mut statement = conn.prepare(
-            "SELECT ts, model, tokens, requests FROM account_limiter_events \
-             WHERE account_id = ?1 AND ts >= ?2 AND (?3 = 0 OR ts < ?3) \
-             AND (?4 = '' OR channel = ?4) ORDER BY ts")?;
-        for ((id, key), condition) in queries {
-            let Some(window) = window_for(&condition) else { continue };
-            let (start, end) = window_bounds(&window, now);
-            let channel = condition.source.as_ref().map(|source| source.channel.as_str()).unwrap_or("");
-            let rows = statement.query_map(params![id, start, end, channel], |row| {
-                Ok(Event { ts: row.get(0)?, model: row.get(1)?, tokens: row.get(2)?, requests: row.get(3)? })
-            })?;
-            let mut count = Count { start, end, watermark, window,
-                models: models_for(&condition).to_vec(), channel: channel.to_string(), ..Count::default() };
-            for row in rows {
-                let event = row?;
-                if count.models.is_empty() || count.models.iter().any(|wanted| wanted.eq_ignore_ascii_case(&event.model)) {
-                    count.add(event);
+    {
+        let mut slot = match slot().lock() { Ok(slot) => slot, Err(_) => return };
+        let fresh = db.with_read(|conn| -> rusqlite::Result<Facts> {
+            let watermark: i64 = conn.query_row("SELECT COALESCE(MAX(row_id), 0) FROM account_limiter_events", [], |row| row.get(0))?;
+            let mut facts = Facts::new();
+            let mut statement = conn.prepare(
+                "SELECT ts, model, tokens, requests FROM account_limiter_events \
+                 WHERE account_id = ?1 AND ts >= ?2 AND (?3 = 0 OR ts < ?3) \
+                 AND (?4 = '' OR channel = ?4) ORDER BY ts")?;
+            for ((id, key), condition) in queries {
+                let Some(window) = window_for(&condition) else { continue };
+                let (start, end) = window_bounds(&window, now);
+                let channel = condition.source.as_ref().map(|source| source.channel.as_str()).unwrap_or("");
+                let rows = statement.query_map(params![id, start, end, channel], |row| {
+                    Ok(Event { ts: row.get(0)?, model: row.get(1)?, tokens: row.get(2)?, requests: row.get(3)? })
+                })?;
+                let mut count = Count { start, end, watermark, window,
+                    models: models_for(&condition).to_vec(), channel: channel.to_string(), ..Count::default() };
+                for row in rows {
+                    let event = row?;
+                    if count.models.is_empty() || count.models.iter().any(|wanted| wanted.eq_ignore_ascii_case(&event.model)) {
+                        count.add(event);
+                    }
+                }
+                facts.insert((id, key), count);
+            }
+            Ok(facts)
+        }).and_then(Result::ok);
+        if let Some(fresh) = fresh {
+            if replace { *slot = fresh; }
+            else {
+                slot.retain(|(id, _), _| !ids.contains(&id.as_str()));
+                slot.extend(fresh);
+            }
+        }
+    }
+    if replace {
+        maybe_prune_expired(db, accounts, now);
+    }
+}
+
+const PRUNE_RETENTION_MS: i64 = 35 * 86_400_000;
+const PRUNE_INTERVAL_MS: i64 = 6 * 3_600_000;
+const PRUNE_BATCH_SIZE: usize = 5_000;
+const PRUNE_MAX_BATCHES: usize = 10;
+
+static LAST_PRUNE_MS: AtomicI64 = AtomicI64::new(0);
+
+fn protected_total_accounts(accounts: &[serde_json::Value], cutoff: i64, now: i64) -> HashSet<String> {
+    let mut protected = HashSet::new();
+    for account in accounts {
+        let Some(id) = account.get("id").and_then(serde_json::Value::as_str) else { continue };
+        for group in super::groups::effective_groups(account) {
+            for condition in group.conditions {
+                if !matches!(condition.metric, Metric::Tokens | Metric::Requests) { continue; }
+                let Some(window) = window_for(&condition) else { continue };
+                if window.reset == Reset::Total
+                    && window.starts_at < cutoff
+                    && (window.ends_at == 0 || window.ends_at > now)
+                {
+                    protected.insert(id.to_string());
+                    break;
                 }
             }
-            facts.insert((id, key), count);
         }
-        Ok(facts)
-    }).and_then(Result::ok);
-    if let Some(fresh) = fresh {
-        if replace { *slot = fresh; }
-        else {
-            slot.retain(|(id, _), _| !ids.contains(&id.as_str()));
-            slot.extend(fresh);
+    }
+    protected
+}
+
+pub(crate) fn prune_expired_in_conn(
+    conn: &rusqlite::Connection,
+    accounts: &[serde_json::Value],
+    now: i64,
+    batch_limit: usize,
+) -> rusqlite::Result<usize> {
+    let cutoff = now.saturating_sub(PRUNE_RETENTION_MS);
+    let protected = protected_total_accounts(accounts, cutoff, now);
+    let limit = i64::try_from(batch_limit.max(1)).unwrap_or(i64::MAX);
+    if protected.is_empty() {
+        return conn.execute(
+            "DELETE FROM account_limiter_events \
+             WHERE row_id IN (SELECT row_id FROM account_limiter_events WHERE ts < ?1 ORDER BY ts ASC LIMIT ?2)",
+            params![cutoff, limit],
+        );
+    }
+    if protected.len() <= 200 {
+        let mut protected_list: Vec<String> = protected.into_iter().collect();
+        protected_list.sort();
+        let placeholders = (0..protected_list.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let limit_slot = protected_list.len() + 2;
+        let sql = format!(
+            "DELETE FROM account_limiter_events WHERE row_id IN ( \
+               SELECT row_id FROM account_limiter_events \
+               WHERE ts < ?1 AND account_id NOT IN ({placeholders}) \
+               ORDER BY ts ASC LIMIT ?{limit_slot} \
+             )"
+        );
+        let mut binds: Vec<rusqlite::types::Value> = Vec::with_capacity(protected_list.len() + 2);
+        binds.push(rusqlite::types::Value::Integer(cutoff));
+        for id in protected_list {
+            binds.push(rusqlite::types::Value::Text(id));
+        }
+        binds.push(rusqlite::types::Value::Integer(limit));
+        return conn.execute(&sql, params_from_iter(binds.iter()));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT row_id, account_id FROM account_limiter_events WHERE ts < ?1 ORDER BY ts ASC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![cutoff, limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let deletable: Vec<i64> = rows
+        .into_iter()
+        .filter(|(_, account_id)| !protected.contains(account_id))
+        .map(|(row_id, _)| row_id)
+        .collect();
+    if deletable.is_empty() {
+        return Ok(0);
+    }
+    let mut total_deleted = 0usize;
+    for chunk in deletable.chunks(500) {
+        let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM account_limiter_events WHERE row_id IN ({placeholders})");
+        total_deleted += conn.execute(&sql, params_from_iter(chunk.iter()))?;
+    }
+    Ok(total_deleted)
+}
+
+fn maybe_prune_expired(db: &Db, accounts: &[serde_json::Value], now: i64) {
+    let last = LAST_PRUNE_MS.load(Ordering::Acquire);
+    if last != 0 && now.saturating_sub(last) < PRUNE_INTERVAL_MS {
+        return;
+    }
+    if LAST_PRUNE_MS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    for _ in 0..PRUNE_MAX_BATCHES {
+        let deleted = db
+            .with_mut(|conn| -> rusqlite::Result<usize> {
+                let tx = conn.transaction()?;
+                let removed = prune_expired_in_conn(&tx, accounts, now, PRUNE_BATCH_SIZE)?;
+                tx.commit()?;
+                Ok(removed)
+            })
+            .and_then(Result::ok)
+            .unwrap_or(0);
+        if deleted < PRUNE_BATCH_SIZE {
+            break;
         }
     }
 }
