@@ -98,10 +98,10 @@ pub(crate) fn sync_installed_update_channel(version: &str) -> bool {
     let changed = entering_beta && !update_channels().beta;
     let saved = update(|config| {
         if changed {
-            config.raw.insert(KEY_UPDATE_BETA.to_string(), Value::Bool(true));
+            config.raw_mut().insert(KEY_UPDATE_BETA.to_string(), Value::Bool(true));
             config.update_channels.beta = true;
         }
-        config.raw.insert(
+        config.raw_mut().insert(
             KEY_INSTALLED_UPDATE_VERSION.to_string(),
             Value::String(version.to_string()),
         );
@@ -135,12 +135,12 @@ pub fn set_update_channels(
     let saved = update(|config| {
         if let Some(stable) = patch.stable {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_UPDATE_STABLE.to_string(), Value::Bool(stable));
         }
         if let Some(beta) = patch.beta {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_UPDATE_BETA.to_string(), Value::Bool(beta));
         }
         config.update_channels = next;

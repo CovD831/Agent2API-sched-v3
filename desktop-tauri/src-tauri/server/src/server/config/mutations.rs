@@ -37,7 +37,7 @@ fn try_update_raw_fields_inner<T, E>(
         return Err(storage_error());
     };
     let previous = next.clone();
-    let result = mutate(&mut next.raw)?;
+    let result = mutate(next.raw_mut())?;
     if next.raw == previous.raw {
         return Ok(result);
     }

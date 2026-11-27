@@ -219,14 +219,14 @@ pub(crate) fn save(object: &Map<String, Value>) -> Result<(), (i32, String)> {
     }
     if let Some(value) = desktop {
         next.captcha_desktop = value;
-        next.raw.insert(KEY_CAPTCHA_DESKTOP.into(), json!(value));
+        next.raw_mut().insert(KEY_CAPTCHA_DESKTOP.into(), json!(value));
     }
     if let Some(value) = web {
         next.captcha_web = value;
-        next.raw.insert(KEY_CAPTCHA_WEB.into(), json!(value));
+        next.raw_mut().insert(KEY_CAPTCHA_WEB.into(), json!(value));
     }
     if changing_provider {
-        next.raw.insert(
+        next.raw_mut().insert(
             KEY_PANEL_CAPTCHA.into(),
             json!({
                 "provider": settings.provider, "siteKey": settings.site_key,

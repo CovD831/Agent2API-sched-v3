@@ -285,8 +285,8 @@ pub struct RuntimeConfig {
     update_proxy: Option<Value>,
     /// 正式版与 beta 的关注策略；与当前安装版本无关。
     update_channels: UpdateChannels,
-    /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
-    raw: Map<String, Value>,
+    /// 磁盘上那份 JSON 对象（含未知字段），Arc 共享读快照、写时再复制
+    raw: std::sync::Arc<Map<String, Value>>,
 }
 
 impl RuntimeConfig {
@@ -434,7 +434,12 @@ impl RuntimeConfig {
 
     /// 原始 JSON 底稿（后续切片读自定义字段用）
     pub fn raw(&self) -> &Map<String, Value> {
-        &self.raw
+        self.raw.as_ref()
+    }
+
+    /// 按写时复制获取底稿的可变引用（仅用于配置写入路径，避免读路径深拷贝）。
+    pub(super) fn raw_mut(&mut self) -> &mut Map<String, Value> {
+        std::sync::Arc::make_mut(&mut self.raw)
     }
 }
 
@@ -443,25 +448,27 @@ pub fn account_defaults_max_concurrent_of(provider: &str) -> Option<u64> {
     if provider.is_empty() {
         return None;
     }
-    let cfg = current();
-    cfg.raw
-        .get("accountDefaults")
-        .and_then(Value::as_object)
-        .and_then(|map| map.get(provider))
-        .and_then(Value::as_object)
-        .and_then(|entry| entry.get("maxConcurrent"))
-        .and_then(Value::as_u64)
-        .map(|v| v.min(999))
+    with_raw(|raw| {
+        raw.get("accountDefaults")
+            .and_then(Value::as_object)
+            .and_then(|map| map.get(provider))
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("maxConcurrent"))
+            .and_then(Value::as_u64)
+            .map(|v| v.min(999))
+    })
+    .flatten()
 }
 
 /// 0026 流绝对最大寿命毫秒数（读取 `streamMaxLifetimeSeconds`，默认 900s，夹紧于 60~7200s）。
 pub fn stream_max_lifetime_ms() -> u64 {
-    let secs = current()
-        .raw
-        .get("streamMaxLifetimeSeconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(900)
-        .clamp(60, 7200);
+    let secs = with_raw(|raw| {
+        raw.get("streamMaxLifetimeSeconds")
+            .and_then(Value::as_u64)
+    })
+    .flatten()
+    .unwrap_or(900)
+    .clamp(60, 7200);
     secs * 1000
 }
 
@@ -724,7 +731,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .filter(|value| !value.is_null())
             .cloned(),
         update_channels: UpdateChannels::from_raw(&raw),
-        raw,
+        raw: std::sync::Arc::new(raw),
     }
 }
 
@@ -1485,7 +1492,7 @@ pub fn set_api_key(api_key: Option<String>) -> Result<bool, String> {
         // 见 `set_update_proxy` / `set_prompt` 的「与 set_api_key(None) 同一语义」）。
         // 这条路不经过加密，因此 `Err` 不可能出现
         return Ok(update(|config| {
-            config.raw.remove(crate::server::core::api_keys::KEY_API_KEY);
+            config.raw_mut().remove(crate::server::core::api_keys::KEY_API_KEY);
             config.api_key = None;
         }));
     };
@@ -1497,7 +1504,7 @@ pub fn set_api_key(api_key: Option<String>) -> Result<bool, String> {
         crate::server::core::crypto::SecretScope::Accounts,
     )?;
     Ok(update(move |config| {
-        config.raw.insert(
+        config.raw_mut().insert(
             crate::server::core::api_keys::KEY_API_KEY.to_string(),
             Value::String(envelope.clone()),
         );
@@ -1512,9 +1519,9 @@ pub fn set_api_key(api_key: Option<String>) -> Result<bool, String> {
 pub fn replace_api_keys(list: Value) -> bool {
     update(move |config| {
         config
-            .raw
+            .raw_mut()
             .insert(crate::server::core::api_keys::KEY_API_KEYS.to_string(), list.clone());
-        config.raw.remove(crate::server::core::api_keys::KEY_API_KEY);
+        config.raw_mut().remove(crate::server::core::api_keys::KEY_API_KEY);
         config.api_key = None;
     })
 }
@@ -1523,7 +1530,7 @@ pub fn replace_api_keys(list: Value) -> bool {
 pub fn set_locale(locale: &str) -> bool {
     let locale = locale.to_string();
     update(|config| {
-        config.raw.insert("locale".to_string(), Value::String(locale.clone()));
+        config.raw_mut().insert("locale".to_string(), Value::String(locale.clone()));
         config.locale = locale.clone();
     })
 }
@@ -1537,7 +1544,7 @@ pub fn remember_request_model(model: &str) {
     let value = trimmed.to_string();
     update(|config| {
         config
-            .raw
+            .raw_mut()
             .insert("lastRequestModel".to_string(), Value::String(value.clone()));
         config.last_request_model = Some(value.clone());
     });
@@ -1552,13 +1559,13 @@ pub fn update_raw_field(key: &str, value: Value) -> bool {
 /// 逐键 `update_raw_field` 会每键落一次库，且派生快照只重建被点名的几项；
 /// 批量改完由调用方补一次 `reload()`，让所有派生快照与库对齐。
 pub(crate) fn update_raw_fields(mutate: impl FnOnce(&mut Map<String, Value>)) -> bool {
-    update(move |config| mutate(&mut config.raw))
+    update(move |config| mutate(config.raw_mut()))
 }
 
 pub(crate) fn update_raw_field_with(key: &str, mutate: impl FnOnce(&mut Value)) -> bool {
     let key = key.to_string();
     update(move |config| {
-        mutate(config.raw.entry(key.clone()).or_insert(Value::Null));
+        mutate(config.raw_mut().entry(key.clone()).or_insert(Value::Null));
         // apiKey 属于「生效字段」，写它时要同步内存里的值。这里存的是**磁盘原值**
         // （本函数也会被用来往这个键里写 `enc1:` 信封，见 `core::legacy_api_key`
         // 的原地加密迁移），给界面看的解密在 `RuntimeConfig::masked_api_key` 里
@@ -1601,7 +1608,7 @@ pub fn set_retention(patch: RetentionPatch) -> bool {
         // 未传的项保持原值，不把默认值固化到配置里。
         let mut apply = |key: &str, value: Option<i64>, slot: &mut i64| {
             if let Some(value) = value {
-                config.raw.insert(key.to_string(), Value::from(value));
+                config.raw_mut().insert(key.to_string(), Value::from(value));
                 *slot = value;
             }
         };
@@ -1647,7 +1654,7 @@ pub fn set_scheduled_task(
         // 用 `entry` 形态而不是「重建整个 scheduledTasks」：后者会抹掉其它三条
         // 任务的设置，以及将来可能加进去的兄弟字段。
         let root = config
-            .raw
+            .raw_mut()
             .entry(KEY_SCHEDULED_TASKS.to_string())
             .or_insert_with(|| Value::Object(Map::new()));
         if !root.is_object() {
@@ -1698,18 +1705,18 @@ pub fn set_retry(patch: RetryPatch) -> bool {
     update(|config| {
         let mut next = config.retry.clone();
         if let Some(count) = patch.count {
-            config.raw.insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
+            config.raw_mut().insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
             next.count = count;
         }
         if let Some(count) = patch.account_switch_count {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(), Value::from(count));
             next.account_switch_count = count;
         }
         if let Some(seconds) = patch.interval_seconds {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_RETRY_INTERVAL_SECONDS.to_string(), Value::from(seconds));
             next.interval_seconds = seconds;
         }
@@ -1718,12 +1725,12 @@ pub fn set_retry(patch: RetryPatch) -> bool {
             // 这里原样落库）；内存快照换成新的共享切片
             let array: Vec<Value> = codes.iter().map(|code| Value::from(*code)).collect();
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_RETRY_NO_RETRY_CODES.to_string(), Value::Array(array));
             next.no_retry_codes = std::sync::Arc::from(codes.as_slice());
         }
         config.retry = next;
-        error_policy::sync_legacy(&mut config.raw, patch.no_retry_codes.is_some());
+        error_policy::sync_legacy(config.raw_mut(), patch.no_retry_codes.is_some());
         config.error_policy = error_policy::from_raw(&config.raw);
     })
 }
@@ -1753,7 +1760,7 @@ pub fn set_timeouts(patch: TimeoutPatch) -> bool {
     update(|config| {
         let mut next = config.timeouts;
         let mut write = |key: &str, value: i64, slot: &mut i64| {
-            config.raw.insert(key.to_string(), Value::from(value));
+            config.raw_mut().insert(key.to_string(), Value::from(value));
             *slot = value;
         };
         if let Some(seconds) = patch.connect_seconds {
@@ -1801,13 +1808,13 @@ pub fn set_queue(patch: QueuePatch) -> bool {
         let mut next = config.queue;
         if let Some(count) = patch.max_waits {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_QUEUE_MAX_WAITS.to_string(), Value::from(count));
             next.max_waits = count;
         }
         if let Some(seconds) = patch.wait_seconds {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_QUEUE_WAIT_SECONDS.to_string(), Value::from(seconds));
             next.wait_seconds = seconds;
         }
@@ -1840,18 +1847,18 @@ pub fn set_captcha_pool(patch: CaptchaPoolPatch) -> bool {
         let mut next = config.captcha_pool;
         if let Some(target) = patch.target {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_CAPTCHA_POOL_TARGET.to_string(), Value::from(target));
             next.target = target;
         }
         if let Some(poll_ms) = patch.poll_ms {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_CAPTCHA_POOL_POLL_MS.to_string(), Value::from(poll_ms));
             next.poll_ms = poll_ms;
         }
         if let Some(max_per_round) = patch.max_per_round {
-            config.raw.insert(
+            config.raw_mut().insert(
                 KEY_CAPTCHA_POOL_MAX_PER_ROUND.to_string(),
                 Value::from(max_per_round),
             );
@@ -1886,12 +1893,12 @@ pub fn set_image_compress(patch: ImageCompressPatch) -> bool {
         let mut next = config.image_compress;
         if let Some(enabled) = patch.enabled {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_IMAGE_COMPRESS_ENABLED.to_string(), Value::Bool(enabled));
             next.enabled = enabled;
         }
         let mut write_int = |key: &str, value: i64, slot: &mut i64| {
-            config.raw.insert(key.to_string(), Value::from(value));
+            config.raw_mut().insert(key.to_string(), Value::from(value));
             *slot = value;
         };
         if let Some(max_edge) = patch.max_edge {
@@ -1936,18 +1943,18 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
         let mut next = config.routing;
         if let Some(strategy) = patch.strategy {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_ROUTING_STRATEGY.to_string(), Value::from(strategy.as_str()));
             next.strategy = strategy;
         }
         if let Some(sticky) = patch.sticky {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_ROUTING_STICKY.to_string(), Value::from(sticky.as_str()));
             next.sticky = sticky;
         }
         let mut write_bool = |key: &str, value: bool, slot: &mut bool| {
-            config.raw.insert(key.to_string(), Value::Bool(value));
+            config.raw_mut().insert(key.to_string(), Value::Bool(value));
             *slot = value;
         };
         if let Some(enabled) = patch.failover_backoff {
@@ -1961,24 +1968,24 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
         }
         if let Some(count) = patch.breaker_threshold {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_ROUTING_BREAKER_THRESHOLD.to_string(), Value::from(count));
             next.breaker_threshold = count;
         }
         if let Some(seconds) = patch.breaker_timeout_seconds {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_ROUTING_BREAKER_TIMEOUT.to_string(), Value::from(seconds));
             next.breaker_timeout_seconds = seconds;
         }
         if let Some(count) = patch.breaker_success_threshold {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_ROUTING_BREAKER_SUCCESS.to_string(), Value::from(count));
             next.breaker_success_threshold = count;
         }
         config.routing = next;
-        error_policy::sync_legacy(&mut config.raw, false);
+        error_policy::sync_legacy(config.raw_mut(), false);
         config.error_policy = error_policy::from_raw(&config.raw);
     })
 }
@@ -1993,7 +2000,7 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
 pub fn set_debug_mode(enabled: bool) -> bool {
     update(|config| {
         config
-            .raw
+            .raw_mut()
             .insert(KEY_DEBUG_MODE.to_string(), Value::Bool(enabled));
         config.debug_mode = enabled;
     })
@@ -2023,7 +2030,7 @@ pub fn set_sanitize_fingerprints(enabled: bool) -> bool {
 pub fn set_developer_role_compat(enabled: bool) -> bool {
     update(|config| {
         config
-            .raw
+            .raw_mut()
             .insert(KEY_DEVELOPER_ROLE_COMPAT.to_string(), Value::Bool(enabled));
         config.developer_role_compat = enabled;
     })
@@ -2038,7 +2045,7 @@ pub fn set_developer_role_compat(enabled: bool) -> bool {
 /// 不吃掉配置里的其它字段。
 pub fn set_third_party_reasoning_collapse(enabled: bool) -> bool {
     update(|config| {
-        config.raw.insert(
+        config.raw_mut().insert(
             KEY_THIRD_PARTY_REASONING_COLLAPSE.to_string(),
             Value::Bool(enabled),
         );
@@ -2063,7 +2070,7 @@ pub fn set_cline_upstream_headers(overrides: std::collections::BTreeMap<String, 
     );
     update(|config| {
         config
-            .raw
+            .raw_mut()
             .insert(KEY_CLINE_UPSTREAM_HEADERS.to_string(), value.clone());
         config.cline_upstream_headers = overrides;
     })
@@ -2079,7 +2086,7 @@ pub fn set_cline_upstream_headers(overrides: std::collections::BTreeMap<String, 
 pub fn set_cors_enabled(enabled: bool) -> bool {
     update(|config| {
         config
-            .raw
+            .raw_mut()
             .insert(KEY_CORS_ENABLED.to_string(), Value::Bool(enabled));
         config.cors_enabled = enabled;
     })
@@ -2093,7 +2100,7 @@ pub fn set_assistant_config(config: AssistantConfig) -> bool {
     let value = config.to_value();
     update(|current| {
         current
-            .raw
+            .raw_mut()
             .insert(KEY_ASSISTANT_CONFIG.to_string(), value);
         current.assistant = config;
     })
@@ -2110,7 +2117,7 @@ pub fn set_assistant_config(config: AssistantConfig) -> bool {
 pub fn set_strip_newline_keepalive(enabled: bool) -> bool {
     update(|config| {
         config
-            .raw
+            .raw_mut()
             .insert(KEY_STRIP_NEWLINE_KEEPALIVE.to_string(), Value::Bool(enabled));
         config.strip_newline_keepalive = enabled;
     })
@@ -2137,13 +2144,13 @@ pub fn set_auto_continue_patch(patch: AutoContinuePatch) -> bool {
     update(|config| {
         if let Some(enabled) = patch.enabled {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_AUTO_CONTINUE.to_string(), Value::Bool(enabled));
             config.auto_continue = enabled;
         }
         if let Some(rounds) = patch.max_rounds {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_AUTO_CONTINUE_MAX_ROUNDS.to_string(), Value::from(rounds));
             config.auto_continue_max_rounds = rounds;
         }
@@ -2205,13 +2212,13 @@ pub fn set_captcha_patch(desktop: Option<bool>, web: Option<bool>) -> bool {
     update(|config| {
         if let Some(enabled) = desktop {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_CAPTCHA_DESKTOP.to_string(), Value::Bool(enabled));
             config.captcha_desktop = enabled;
         }
         if let Some(enabled) = web {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_CAPTCHA_WEB.to_string(), Value::Bool(enabled));
             config.captcha_web = enabled;
         }
@@ -2226,7 +2233,7 @@ pub fn set_captcha_patch(desktop: Option<bool>, web: Option<bool>) -> bool {
 pub fn set_models_dev_enabled(enabled: bool) -> bool {
     update(|config| {
         config
-            .raw
+            .raw_mut()
             .insert(KEY_MODELS_DEV_ENABLED.to_string(), Value::Bool(enabled));
         config.models_dev_enabled = enabled;
     })
@@ -2258,13 +2265,13 @@ pub fn set_update_proxy(proxy: Option<Value>) -> bool {
     update(move |config| {
         match proxy.clone() {
             Some(value) => {
-                config.raw.insert(KEY_UPDATE_PROXY.to_string(), value);
+                config.raw_mut().insert(KEY_UPDATE_PROXY.to_string(), value);
                 config.update_proxy = proxy.clone();
             }
             None => {
                 // 直连**删掉键**而不是写 null：与 set_api_key(None) 同一语义，
                 // 配置里不留没意义的空值（读侧也按缺省 = 直连处理）
-                config.raw.remove(KEY_UPDATE_PROXY);
+                config.raw_mut().remove(KEY_UPDATE_PROXY);
                 config.update_proxy = None;
             }
         }
@@ -2292,26 +2299,26 @@ pub fn set_prompt(
 ) -> bool {
     update(|config| {
         config
-            .raw
+            .raw_mut()
             .insert(KEY_PROMPT_MODE.to_string(), Value::String(mode.as_str().to_string()));
         match file.filter(|text| !text.trim().is_empty()) {
             Some(path) => {
                 config
-                    .raw
+                    .raw_mut()
                     .insert(KEY_PROMPT_FILE.to_string(), Value::String(path));
             }
             None => {
-                config.raw.remove(KEY_PROMPT_FILE);
+                config.raw_mut().remove(KEY_PROMPT_FILE);
             }
         }
         match inline.filter(|text| !text.trim().is_empty()) {
             Some(text) => {
                 config
-                    .raw
+                    .raw_mut()
                     .insert(KEY_PROMPT_TEXT.to_string(), Value::String(text));
             }
             None => {
-                config.raw.remove(KEY_PROMPT_TEXT);
+                config.raw_mut().remove(KEY_PROMPT_TEXT);
             }
         }
         config.prompt = prompt_from(&config.raw);
@@ -2358,10 +2365,10 @@ pub fn set_prompt_provider(provider_id: &str, patch: Option<ProviderPromptPatch>
         // 一家都不剩时把整个键删掉：配置里不留下没意义的空对象
         // （与 `set_prompt` 对空文件路径的处理同一取向）
         if entry.is_empty() {
-            config.raw.remove(KEY_PROMPT_PROVIDERS);
+            config.raw_mut().remove(KEY_PROMPT_PROVIDERS);
         } else {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_PROMPT_PROVIDERS.to_string(), Value::Object(entry));
         }
         config.prompt = prompt_from(&config.raw);
@@ -2447,7 +2454,7 @@ pub fn migrate_workbuddy_split_prompt_providers() -> Option<String> {
         let mut next = table;
         next.insert(intl.to_string(), inherited);
         config
-            .raw
+            .raw_mut()
             .insert(KEY_PROMPT_PROVIDERS.to_string(), Value::Object(next));
         config.prompt = prompt_from(&config.raw);
         summary = Some(format!(
@@ -2491,10 +2498,10 @@ pub fn set_prompt_gateway_text(
             table.insert(id.clone(), Value::Object(one));
         }
         if table.is_empty() {
-            config.raw.remove(KEY_PROMPT_GATEWAY_TEXT);
+            config.raw_mut().remove(KEY_PROMPT_GATEWAY_TEXT);
         } else {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_PROMPT_GATEWAY_TEXT.to_string(), Value::Object(table));
         }
         config.prompt = prompt_from(&config.raw);
@@ -2527,10 +2534,10 @@ pub fn set_prompt_gateway(provider_id: &str, flag: Option<bool>) -> bool {
             }
         }
         if table.is_empty() {
-            config.raw.remove(KEY_PROMPT_GATEWAY);
+            config.raw_mut().remove(KEY_PROMPT_GATEWAY);
         } else {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_PROMPT_GATEWAY.to_string(), Value::Object(table));
         }
         // 解析复用同一入口：`gateway` 与 `providers` 一起刷新，不会出现
@@ -2778,6 +2785,55 @@ mod auto_continue_tests {
                     enabled: Some(false),
                     max_rounds: Some(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS),
                 });
+            },
+        );
+    }
+
+    #[test]
+    fn runtime_config_clone_shares_raw_arc_and_cow_on_update() {
+        let cfg1 = build(raw_of(&[
+            ("accountDefaults", json!({ "deepseek": { "maxConcurrent": 3 } })),
+            ("streamMaxLifetimeSeconds", json!(1200)),
+        ]));
+        let mut cfg2 = cfg1.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&cfg1.raw, &cfg2.raw),
+            "cloning RuntimeConfig must share raw Arc without deep-cloning the map"
+        );
+
+        cfg2.raw_mut().insert("streamMaxLifetimeSeconds".into(), json!(600));
+        assert!(
+            !std::sync::Arc::ptr_eq(&cfg1.raw, &cfg2.raw),
+            "raw_mut() must copy-on-write when Arc has multiple owners"
+        );
+        assert_eq!(cfg1.raw().get("streamMaxLifetimeSeconds"), Some(&json!(1200)));
+        assert_eq!(cfg2.raw().get("streamMaxLifetimeSeconds"), Some(&json!(600)));
+
+        crate::test_support::isolated(
+            concat!(module_path!(), "::runtime_config_clone_shares_raw_arc_and_cow_on_update"),
+            || {
+                let _guard = hold_config();
+                init(None);
+                let _ = update_raw_field(
+                    "accountDefaults",
+                    json!({ "deepseek": { "maxConcurrent": 7 } }),
+                );
+                let _ = update_raw_field("streamMaxLifetimeSeconds", json!(300));
+
+                let snap_a = current();
+                let snap_b = current();
+                assert!(std::sync::Arc::ptr_eq(&snap_a.raw, &snap_b.raw));
+                assert_eq!(account_defaults_max_concurrent_of("deepseek"), Some(7));
+                assert_eq!(stream_max_lifetime_ms(), 300_000);
+
+                let _ = update_raw_fields(|raw| {
+                    raw.remove("accountDefaults");
+                    raw.remove("streamMaxLifetimeSeconds");
+                });
+                let snap_c = current();
+                assert!(!std::sync::Arc::ptr_eq(&snap_a.raw, &snap_c.raw));
+                assert_eq!(account_defaults_max_concurrent_of("deepseek"), None);
+                assert_eq!(stream_max_lifetime_ms(), 900_000);
             },
         );
     }

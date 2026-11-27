@@ -207,13 +207,16 @@ const FETCH_MODELS_TIMEOUT_MS: u64 = 15_000;
 /// baseUrl / enabled）缺失时按各自默认值补齐（见 `item_of`），不在这里丢弃 ——
 /// 「能列出来但编辑时才报缺字段」比「静默消失」好定位。
 fn read_items() -> Vec<Value> {
-    let raw = config::current();
-    let items = raw
-        .raw()
-        .get(KEY_CUSTOM_PROVIDERS)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let items = config::with_raw(|raw| {
+        raw.get(KEY_CUSTOM_PROVIDERS)
+            .and_then(Value::as_array)
+            .cloned()
+    })
+    .flatten()
+    .unwrap_or_default();
+    if items.is_empty() {
+        return Vec::new();
+    }
     let mut items: Vec<Value> = items
         .into_iter()
         .filter_map(|item| {

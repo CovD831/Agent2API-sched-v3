@@ -66,7 +66,7 @@ pub(crate) fn migrate(store: &AccountStore, expected: &str) -> Result<(), String
             rusqlite::params![serialized.to_string()])?;
         tx.commit()
     }).map_err(|error| error.message)?;
-    next.raw.insert(config::KEY_ROUTING_PROFILES.into(), serialized);
+    next.raw_mut().insert(config::KEY_ROUTING_PROFILES.into(), serialized);
     next.routing_profiles = Arc::new(profiles);
     crate::server::core::providers::catalog::invalidate();
     *config::CONFIG.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next);

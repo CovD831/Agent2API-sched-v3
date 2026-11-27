@@ -88,7 +88,7 @@ pub fn set_sanitize_settings(patch: SanitizePatch) -> bool {
     update(|config| {
         if let Some(enabled) = patch.enabled {
             config
-                .raw
+                .raw_mut()
                 .insert(KEY_SANITIZE_FINGERPRINTS.to_string(), Value::Bool(enabled));
             config.sanitize.enabled = enabled;
         }
@@ -97,19 +97,19 @@ pub fn set_sanitize_settings(patch: SanitizePatch) -> bool {
                 Some(rules) => {
                     let entries =
                         serde_json::to_value(rules.entries()).expect("脱敏词表必须可序列化");
-                    config.raw.insert(KEY_SANITIZE_RULES.to_string(), entries);
+                    config.raw_mut().insert(KEY_SANITIZE_RULES.to_string(), entries);
                     config.sanitize.rules = rules;
                     config.sanitize.custom_rules = true;
                 }
                 None => {
-                    config.raw.remove(KEY_SANITIZE_RULES);
+                    config.raw_mut().remove(KEY_SANITIZE_RULES);
                     config.sanitize.rules = sanitize::default_rules();
                     config.sanitize.custom_rules = false;
                 }
             }
         }
         if let Some(providers) = patch.providers {
-            config.raw.insert(
+            config.raw_mut().insert(
                 KEY_SANITIZE_PROVIDERS.to_string(),
                 Value::from(providers.clone()),
             );

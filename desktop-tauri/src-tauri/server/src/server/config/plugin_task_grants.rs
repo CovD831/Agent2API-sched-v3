@@ -63,7 +63,7 @@ pub(crate) fn confirm(confirmation: Confirmation) -> Result<ConfirmationResult, 
     }
     let value = confirmation.updated_grants(next.raw.get(KEY))?;
     let before = super::synced_fingerprint(&next.raw);
-    next.raw.insert(KEY.to_string(), value);
+    next.raw_mut().insert(KEY.to_string(), value);
     // save_raw只有true能证明提交成功；false不生成保存回执，也不发布授权内存值。
     if !super::save_raw(&next.raw) {
         return Ok(ConfirmationResult {
@@ -172,7 +172,7 @@ pub(crate) fn revoke<T>(
     let current = next.raw.get(KEY).unwrap_or(&empty);
     let (value, result) = mutate(current)?;
     let before = super::synced_fingerprint(&next.raw);
-    next.raw.insert(KEY.to_string(), value);
+    next.raw_mut().insert(KEY.to_string(), value);
     let saved = super::save_raw(&next.raw);
     let changed = before != super::synced_fingerprint(&next.raw);
     if !publish(next) {

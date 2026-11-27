@@ -71,15 +71,15 @@ pub fn save_workspace(
         }
         let mut global = profile;
         if let Some(profile) = &mut global {
-            if let Some(strategy) = profile.strategy.take() { next.routing.strategy = super::RouteStrategy::from_id(&strategy); next.raw.insert(super::KEY_ROUTING_STRATEGY.into(), strategy.into()); }
-            if let Some(sticky) = profile.sticky.take() { next.routing.sticky = super::StickyMode::from_id(&sticky); next.raw.insert(super::KEY_ROUTING_STICKY.into(), sticky.into()); }
+            if let Some(strategy) = profile.strategy.take() { next.routing.strategy = super::RouteStrategy::from_id(&strategy); next.raw_mut().insert(super::KEY_ROUTING_STRATEGY.into(), strategy.into()); }
+            if let Some(sticky) = profile.sticky.take() { next.routing.sticky = super::StickyMode::from_id(&sticky); next.raw_mut().insert(super::KEY_ROUTING_STICKY.into(), sticky.into()); }
             profile.account_order.clear();
         }
         profiles.global = global;
     } else if let Some(profile) = profile { profiles.models.insert(model.to_string(), profile); }
     else { profiles.models.remove(model); }
     let serialized = serde_json::to_value(&profiles).map_err(|error| error.to_string())?;
-    next.raw.insert("routingProfiles".into(), serialized.clone());
+    next.raw_mut().insert("routingProfiles".into(), serialized.clone());
     store.with_conn_mut(&guard, |conn| {
         let tx = conn.transaction()?;
         tx.execute("INSERT INTO kv(key,value) VALUES('routingProfiles',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![serialized.to_string()])?;

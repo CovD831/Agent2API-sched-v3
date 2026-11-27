@@ -212,7 +212,7 @@ pub fn save_routing_profile(model: &str, profile: Option<RoutingProfile>) -> Res
         }
         match serde_json::to_value(&next) {
             Ok(value) => {
-                config.raw.insert(KEY_ROUTING_PROFILES.to_string(), value);
+                config.raw_mut().insert(KEY_ROUTING_PROFILES.to_string(), value);
                 config.routing_profiles = Arc::new(next);
             }
             Err(error) => result = Err(format!("路由配置序列化失败: {error}")),

@@ -84,7 +84,7 @@ pub fn save_account_sort(provider: &str, rules: Option<Vec<AccountSortRule>>, on
         }
         match serde_json::to_value(&next) {
             Ok(value) => {
-                config.raw.insert(KEY_ACCOUNT_SORT.to_string(), value);
+                config.raw_mut().insert(KEY_ACCOUNT_SORT.to_string(), value);
                 config.account_sort = Arc::new(next);
             }
             Err(cause) => error = Some(format!("账号排序序列化失败: {cause}")),
