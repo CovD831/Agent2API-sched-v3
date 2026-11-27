@@ -592,8 +592,9 @@ pub(super) fn report_attempt_failure(
     } else if error.status_code == 401
         && (msg.contains("APIG.1009") || msg.contains("credentialScope"))
     {
-        AttemptFeedbackKind::RateLimited {
-            reset_at_ms: Some(now_ms + 300_000),
+        service.scheduler.inner.update_quota(node_id, 0.0, None);
+        AttemptFeedbackKind::QuotaExhausted {
+            reset_at_ms: Some(now_ms + 1_800_000),
         }
     } else if error.status_code == 409
         || msg.contains("TM.00001041")

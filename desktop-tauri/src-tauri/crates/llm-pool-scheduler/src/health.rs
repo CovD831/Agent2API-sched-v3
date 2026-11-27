@@ -56,6 +56,10 @@ pub struct HealthConfig {
     pub wave_distinct_accounts_trigger: usize,
     /// Backoff applied to an account instead of quarantine when WaveGuard is active (default `45_000`).
     pub wave_protective_backoff_ms: i64,
+    /// Sliding window (ms) for provider-wide TTFT slow-wave detection (default `180_000` = 3 min).
+    pub slow_wave_window_ms: i64,
+    /// Distinct accounts triggering `ttft_deadline_exceeded` within `slow_wave_window_ms` to trip slow-wave mode (default `2`).
+    pub slow_wave_distinct_accounts_trigger: usize,
 }
 
 impl Default for HealthConfig {
@@ -70,6 +74,8 @@ impl Default for HealthConfig {
             wave_window_ms: 30_000,
             wave_distinct_accounts_trigger: 5,
             wave_protective_backoff_ms: 45_000,
+            slow_wave_window_ms: 180_000,
+            slow_wave_distinct_accounts_trigger: 2,
         }
     }
 }
@@ -178,11 +184,59 @@ struct FailureSample {
 #[derive(Default)]
 pub struct WaveGuard {
     by_scope: Mutex<HashMap<String, VecDeque<FailureSample>>>,
+    slow_by_provider: Mutex<HashMap<String, VecDeque<FailureSample>>>,
 }
 
 impl WaveGuard {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records a TTFT rescue timeout on `(provider, node_id)` and returns `Some(distinct_accounts)`
+    /// if a provider-wide slow wave is currently active.
+    pub fn observe_slow_timeout(
+        &self,
+        provider: &str,
+        node_id: &str,
+        now_ms: i64,
+        cfg: &HealthConfig,
+    ) -> Option<usize> {
+        let node_hash = fnv1a_64(node_id.as_bytes());
+        let mut map = self.slow_by_provider.lock().unwrap_or_else(|e| e.into_inner());
+        let cutoff = now_ms.saturating_sub(cfg.slow_wave_window_ms);
+        let distinct = record_in_window(
+            map.entry(provider.to_string()).or_default(),
+            cutoff,
+            now_ms,
+            node_hash,
+        );
+        (distinct >= cfg.slow_wave_distinct_accounts_trigger).then_some(distinct)
+    }
+
+    pub fn clear_slow_wave(&self, provider: &str) {
+        let mut map = self.slow_by_provider.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(provider);
+    }
+
+    pub fn is_provider_slow_degraded(&self, provider: &str, now_ms: i64, cfg: &HealthConfig) -> bool {
+        let map = self.slow_by_provider.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(queue) = map.get(provider) else {
+            return false;
+        };
+        let cutoff = now_ms.saturating_sub(cfg.slow_wave_window_ms);
+        let mut seen = Vec::with_capacity(cfg.slow_wave_distinct_accounts_trigger);
+        for item in queue.iter().rev() {
+            if item.at_ms < cutoff {
+                break;
+            }
+            if !seen.contains(&item.node_hash) {
+                seen.push(item.node_hash);
+                if seen.len() >= cfg.slow_wave_distinct_accounts_trigger {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Records an error on `(provider, proxy_group, node_id)` and returns `Some(distinct_accounts)`

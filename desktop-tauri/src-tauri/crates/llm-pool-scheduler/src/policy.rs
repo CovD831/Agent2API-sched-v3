@@ -174,7 +174,7 @@ impl SchedulingPolicy for HysteresisLoadBalancePolicy {
         if attempt_index == 0 {
             base
         } else {
-            base.saturating_add(u64::from(attempt_index) * 10_000).min(65_000)
+            base.saturating_add(u64::from(attempt_index) * 5_000).min(60_000)
         }
     }
 }

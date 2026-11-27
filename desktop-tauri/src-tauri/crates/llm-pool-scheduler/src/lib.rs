@@ -432,7 +432,12 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                                 .unwrap_or_else(|e| e.into_inner())
                                 .model_cooling_until(req.model, req.now_ms)
                                 .is_some();
-                            if !model_cooling {
+                            let slow_degraded = self.wave_guard.is_provider_slow_degraded(
+                                &meta.provider,
+                                req.now_ms,
+                                &cfg.health,
+                            );
+                            if !model_cooling && !slow_degraded {
                                 let (view, prov_view) =
                                     self.snapshot_slot_views(&arena, slot, &meta, req.now_ms, &cfg.health);
                                 if let Some(score) = policy.evaluate_cost(&view, &prov_view, req, true) {
@@ -489,18 +494,29 @@ impl<P: SchedulingPolicy> Scheduler<P> {
         // Precompute lightweight provider views once for the allowed providers
         let mut prov_views: HashMap<&str, ProviderRuntimeView> =
             HashMap::with_capacity(req.allowed_providers.len());
+        let mut slow_degraded_map: HashMap<&str, bool> =
+            HashMap::with_capacity(req.allowed_providers.len());
         for &prov in req.allowed_providers {
+            let is_slow = self
+                .wave_guard
+                .is_provider_slow_degraded(prov, req.now_ms, &cfg.health);
+            slow_degraded_map.insert(prov, is_slow);
             prov_views.insert(
                 prov,
                 ProviderRuntimeView {
                     provider: prov.to_string(),
-                    wave_degraded: self.wave_guard.is_provider_degraded(prov, req.now_ms, &cfg.health),
+                    wave_degraded: self
+                        .wave_guard
+                        .is_provider_degraded(prov, req.now_ms, &cfg.health)
+                        || is_slow,
                     ..Default::default()
                 },
             );
         }
 
         let mut drain_fallback: Option<(f64, Arc<NodeSlot>, u32, bool, DecisionTelemetry)> = None;
+        let mut slow_wave_fallback: Option<(f64, Arc<NodeSlot>, u32, bool, DecisionTelemetry)> =
+            None;
         let mut soft_cooldown_fallback: Option<(i64, Arc<NodeSlot>, u32, DecisionTelemetry)> = None;
 
         for tier in tiers {
@@ -555,6 +571,10 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 if matches!(health_state, HealthState::Quarantined) {
                     continue;
                 }
+                let is_slow_degraded = slow_degraded_map
+                    .get(meta.provider.as_str())
+                    .copied()
+                    .unwrap_or(false);
 
                 let inflight_now = slot.inflight.load(Ordering::Acquire);
                 let is_soft_cooling = model_until.is_some()
@@ -568,7 +588,10 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                     if soft_until > req.now_ms {
                         update_min(&mut earliest_cooldown, soft_until);
                     }
-                    if inflight_now == 0
+                    let allow_soft_probe = !(is_slow_degraded
+                        && (req.attempt_index > 0 || matches!(health_state, HealthState::SlowCooldown)));
+                    if allow_soft_probe
+                        && inflight_now == 0
                         && (meta.max_concurrent == 0 || inflight_now < meta.max_concurrent)
                         && soft_until > req.now_ms
                         && soft_until.saturating_sub(req.now_ms) <= 180_000
@@ -654,10 +677,13 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 };
                 if !band.allows_new_flow() {
                     saw_quota_exhausted = true;
-                    if matches!(band, QuotaBand::DrainOnly) {
+                    if matches!(band, QuotaBand::DrainOnly)
+                        && !(is_slow_degraded && req.attempt_index > 0)
+                    {
                         let cap = meta.max_concurrent.max(4) as f64;
                         let util = (inflight_now as f64 + 1.0) / cap;
                         let drain_cost = (meta.priority_tier as f64) * 10.0
+                            + if is_slow_degraded { 10_000.0 } else { 0.0 }
                             + (1.0 - ratio)
                             + util
                             + if matches!(health_state, HealthState::Probation) {
@@ -745,6 +771,50 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                     .get(meta.provider.as_str())
                     .cloned()
                     .unwrap_or_default();
+
+                if is_slow_degraded {
+                    if req.attempt_index > 0 {
+                        update_min(&mut earliest_cooldown, req.now_ms.saturating_add(30_000));
+                        continue;
+                    }
+                    if let Some(cost) = policy.evaluate_cost(&view, &prov_view, req, false) {
+                        if slow_wave_fallback
+                            .as_ref()
+                            .is_none_or(|(best_cost, _, _, _, _)| cost < *best_cost)
+                        {
+                            let deadline =
+                                policy.attempt_ttft_deadline_ms(&view, &prov_view, req.attempt_index);
+                            let tel = DecisionTelemetry {
+                                picked_slot: slot.slot_id.0,
+                                picked_provider: meta.provider.clone(),
+                                priority_tier: meta.priority_tier,
+                                sticky_requested: !req.sticky_key.is_empty(),
+                                sticky_hit: false,
+                                sticky_migrated,
+                                quota_band: band,
+                                quota_ratio: ratio,
+                                quota_weight: weight,
+                                health_state,
+                                inflight_at_pick: inflight_now,
+                                max_concurrent: meta.max_concurrent,
+                                ewma_ttft_ms: ewma_ttft,
+                                attempt_deadline_ms: deadline,
+                                cost_score: cost,
+                                pool_candidates: total_in_tier,
+                                sampled_k: 1,
+                                dual_shadow_price: shadow,
+                            };
+                            slow_wave_fallback = Some((
+                                cost,
+                                slot.clone(),
+                                meta.max_concurrent,
+                                matches!(health_state, HealthState::Probation),
+                                tel,
+                            ));
+                        }
+                    }
+                    continue;
+                }
 
                 if let Some(cost) = policy.evaluate_cost(&view, &prov_view, req, false) {
                     evaluated += 1;
@@ -835,7 +905,29 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 saw_busy = true;
             }
         }
-        // (2) Earliest soft-cooldown single-flight probe fallback when pool isn't capacity-busy.
+        // (2) Slow-wave single probe fallback when NO non-slow-degraded provider is available (attempt 0 only).
+        if let Some((_cost, slot, max_conc, is_prob, mut tel)) = slow_wave_fallback {
+            if let Some(inflight_after) = slot.try_acquire_slot(max_conc, is_prob) {
+                tel.inflight_at_pick = inflight_after.saturating_sub(1);
+                let decision = ScheduleDecision {
+                    slot_id: slot.slot_id,
+                    node_id: slot.id.clone(),
+                    provider: tel.picked_provider.clone(),
+                    attempt_ttft_deadline_ms: tel.attempt_deadline_ms,
+                    sticky_hit: false,
+                    telemetry: tel,
+                };
+                return Ok((
+                    decision,
+                    ConcurrencyLease {
+                        slot: Some(slot),
+                    },
+                ));
+            } else {
+                saw_busy = true;
+            }
+        }
+        // (3) Earliest soft-cooldown single-flight probe fallback when pool isn't capacity-busy.
         if !saw_busy {
             if let Some((_until, slot, max_conc, mut tel)) = soft_cooldown_fallback {
                 if let Some(inflight_after) = slot.try_acquire_slot(max_conc, true) {
@@ -911,6 +1003,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                         h.record_slow_event(ms, false, feedback.now_ms, &cfg.health);
                     } else {
                         h.record_fast_success(ttft_ms, &feedback.model, &cfg.health);
+                        self.wave_guard.clear_slow_wave(&provider);
                     }
                 }
                 let band_allows_sticky = {
@@ -951,9 +1044,24 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             }
 
             AttemptFeedbackKind::TtftTimeout { elapsed_ms } => {
-                let mut h = slot.health.lock().unwrap_or_else(|e| e.into_inner());
-                h.record_slow_event(elapsed_ms, true, feedback.now_ms, &cfg.health);
+                let wave = self.wave_guard.observe_slow_timeout(
+                    &provider,
+                    &slot.id,
+                    feedback.now_ms,
+                    &cfg.health,
+                );
+                {
+                    let mut h = slot.health.lock().unwrap_or_else(|e| e.into_inner());
+                    h.record_slow_event(elapsed_ms, true, feedback.now_ms, &cfg.health);
+                }
                 self.sticky.remove(&feedback.sticky_key, &feedback.model);
+                if let Some(recent_failures) = wave {
+                    return HostAction::WaveAlert {
+                        provider,
+                        proxy_group,
+                        recent_failures,
+                    };
+                }
                 HostAction::None
             }
 
@@ -1110,6 +1218,10 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                             &meta.provider,
                             now_ms,
                             &cfg.health,
+                        ) || self.wave_guard.is_provider_slow_degraded(
+                            &meta.provider,
+                            now_ms,
+                            &cfg.health,
                         ),
                         ..Default::default()
                     },
@@ -1245,7 +1357,10 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             provider: meta.provider.clone(),
             wave_degraded: self
                 .wave_guard
-                .is_provider_degraded(&meta.provider, now_ms, health_cfg),
+                .is_provider_degraded(&meta.provider, now_ms, health_cfg)
+                || self
+                    .wave_guard
+                    .is_provider_slow_degraded(&meta.provider, now_ms, health_cfg),
             ..Default::default()
         };
         (view, prov_view)
@@ -1764,5 +1879,138 @@ mod tests {
             .expect("freed earliest node accepts next probe");
         assert_eq!(dec_reprobe.node_id, "cool-1");
         drop((lease2, lease3, lease_reprobe));
+    }
+
+    #[test]
+    fn slow_wave_spills_over_to_backup_provider_and_recovers_on_fast_success() {
+        let scheduler = Scheduler::default();
+        let nodes = (0..3)
+            .map(|i| {
+                let mut d = NodeDescriptor::new(format!("loomy-{i}"), "loomy");
+                d.priority_tier = 0;
+                d
+            })
+            .chain((0..2).map(|i| {
+                let mut d = NodeDescriptor::new(format!("backup-{i}"), "codearts");
+                d.priority_tier = 1;
+                d
+            }))
+            .collect::<Vec<_>>();
+        scheduler.sync_nodes(&nodes, 1_000);
+
+        let providers = ["loomy", "codearts"];
+        // Two distinct loomy accounts time out -> trips provider slow-wave guard.
+        let a1 = scheduler.record_feedback(AttemptFeedback {
+            node_id: "loomy-0".into(),
+            model: "glm-5.3-flash".into(),
+            sticky_key: "s1".into(),
+            sticky_ttl_ms: 60_000,
+            kind: AttemptFeedbackKind::TtftTimeout { elapsed_ms: 35_000 },
+            now_ms: 10_000,
+        });
+        assert_eq!(a1, HostAction::None);
+
+        let a2 = scheduler.record_feedback(AttemptFeedback {
+            node_id: "loomy-1".into(),
+            model: "glm-5.3-flash".into(),
+            sticky_key: "s2".into(),
+            sticky_ttl_ms: 60_000,
+            kind: AttemptFeedbackKind::TtftTimeout { elapsed_ms: 35_000 },
+            now_ms: 11_000,
+        });
+        assert!(matches!(
+            a2,
+            HostAction::WaveAlert {
+                ref provider,
+                recent_failures: 2,
+                ..
+            } if provider == "loomy"
+        ));
+
+        // Even though loomy-2 is Active and tier 0, slow-wave spills immediately over to tier 1 codearts!
+        let req = ScheduleRequest {
+            model: "glm-5.3-flash",
+            allowed_providers: &providers,
+            sticky_key: "",
+            sticky_ttl_ms: 0,
+            excluded_node_ids: &[],
+            route_excluded_ids: None,
+            route_allowed_ids: None,
+            pinned_node_id: None,
+            attempt_index: 0,
+            now_ms: 12_000,
+        };
+        let (dec, lease) = scheduler.schedule(&req).expect("spills to healthy tier 1 backup");
+        assert_eq!(dec.provider, "codearts");
+        drop(lease);
+
+        // Once a loomy probe succeeds fast, slow wave clears and tier 0 resumes.
+        scheduler.record_feedback(AttemptFeedback {
+            node_id: "loomy-2".into(),
+            model: "glm-5.3-flash".into(),
+            sticky_key: String::new(),
+            sticky_ttl_ms: 0,
+            kind: AttemptFeedbackKind::Success {
+                ttft_ms: Some(1_500),
+                total_ms: 3_000,
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                cached_tokens: 0,
+                credit_used: None,
+            },
+            now_ms: 15_000,
+        });
+        let (dec_rec, _lease_rec) = scheduler.schedule(&req).expect("tier 0 loomy restored");
+        assert_eq!(dec_rec.provider, "loomy");
+    }
+
+    #[test]
+    fn slow_wave_without_backup_probes_once_and_fails_fast_on_retry() {
+        let scheduler = Scheduler::default();
+        let nodes: Vec<_> = (0..4)
+            .map(|i| NodeDescriptor::new(format!("loomy-{i}"), "loomy"))
+            .collect();
+        scheduler.sync_nodes(&nodes, 1_000);
+
+        for i in 0..2 {
+            scheduler.record_feedback(AttemptFeedback {
+                node_id: format!("loomy-{i}"),
+                model: "qwen3.8-flash".into(),
+                sticky_key: String::new(),
+                sticky_ttl_ms: 0,
+                kind: AttemptFeedbackKind::TtftTimeout { elapsed_ms: 35_000 },
+                now_ms: 10_000 + i * 500,
+            });
+        }
+
+        let providers = ["loomy"];
+        let req_probe = ScheduleRequest {
+            model: "qwen3.8-flash",
+            allowed_providers: &providers,
+            sticky_key: "",
+            sticky_ttl_ms: 0,
+            excluded_node_ids: &[],
+            route_excluded_ids: None,
+            route_allowed_ids: None,
+            pinned_node_id: None,
+            attempt_index: 0,
+            now_ms: 12_000,
+        };
+        let (probe_dec, probe_lease) = scheduler
+            .schedule(&req_probe)
+            .expect("attempt 0 allows one probe when no backup provider exists");
+        assert_eq!(probe_dec.provider, "loomy");
+        drop(probe_lease);
+
+        let excluded = [probe_dec.node_id];
+        let req_retry = ScheduleRequest {
+            excluded_node_ids: &excluded,
+            attempt_index: 1,
+            ..req_probe
+        };
+        assert!(matches!(
+            scheduler.schedule(&req_retry).unwrap_err(),
+            RejectReason::AllCoolingDown { .. }
+        ));
     }
 }

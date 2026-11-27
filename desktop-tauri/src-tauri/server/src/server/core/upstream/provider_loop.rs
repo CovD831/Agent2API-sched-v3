@@ -731,10 +731,20 @@ async fn attempt_queue(
         if ctx.telemetry.is_cancelled() {
             return Err(cancellation::cancelled_error());
         }
-        let mut target = super::account_admission::select(
+        let mut target = match super::account_admission::select(
             service, provider_ids, &cooldown_keys, &tried_ids, ctx.pinned_account,
             &conv_key, &ctx.routing, connections, ctx.telemetry,
-        ).await?;
+        ).await {
+            Ok(target) => target,
+            Err(err) => {
+                if let Some(prev) = last_error.take() {
+                    if prev.code.as_deref() == Some("ttft_deadline_exceeded") {
+                        return Err(prev);
+                    }
+                }
+                return Err(err);
+            }
+        };
         ctx.telemetry.set_attempt_deadline_ms(target.attempt_deadline_ms);
         if let Some(override_proxy) = ctx.proxy_override {
             target.proxy = override_proxy.clone();
