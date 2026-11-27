@@ -264,6 +264,8 @@ pub(super) struct FilterPlan {
     where_sql: String,
     /// 与 `where_sql` 里的 `?` 一一对应的绑定值
     binds: Vec<SqlValue>,
+    is_running_only: bool,
+    can_have_running: bool,
 }
 
 impl FilterPlan {
@@ -337,7 +339,12 @@ impl FilterPlan {
         //     `"error": ""` 的行会落成空串。此时 SQL 判它是「有错误」（`IS NULL`
         //     为假）、Rust 的 `is_success()` 也判它有错误（`Some("")` 不是 `None`）
         //     —— 两边仍然一致。所以这个条件不需要额外的 `error <> ''` 分支。
-        if let Some(want) = normalize_status_filter(filter.status.as_deref()) {
+        let status_filter = normalize_status_filter(filter.status.as_deref());
+        let is_running_only = matches!(status_filter, Some(super::report::StatusFilter::Running))
+            && !filter.completed_only;
+        let can_have_running = !filter.completed_only
+            && matches!(status_filter, None | Some(super::report::StatusFilter::Running));
+        if let Some(want) = status_filter {
             let success = "status >= 200 AND status < 300 AND error IS NULL";
             let fragment = match want {
                 super::report::StatusFilter::Ok => format!("({success})"),
@@ -363,11 +370,21 @@ impl FilterPlan {
         } else {
             format!(" WHERE {}", fragments.join(" AND "))
         };
-        Self { where_sql, binds }
+        Self { where_sql, binds, is_running_only, can_have_running }
     }
 
     pub(super) fn is_empty(&self) -> bool {
         self.where_sql.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn where_sql_for_test(&self) -> &str {
+        &self.where_sql
+    }
+
+    #[cfg(test)]
+    pub(super) fn binds_for_test(&self) -> &[SqlValue] {
+        &self.binds
     }
 }
 
@@ -399,16 +416,17 @@ pub(super) fn filtered_counts(
         let running: i64 = conn.query_row("SELECT COUNT(*) FROM requests WHERE status = 0", [], |row| row.get(0))?;
         return Ok((total, running.max(0) as usize));
     }
-    let sql = format!(
-        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status = 0 THEN 1 ELSE 0 END), 0) \
-         FROM requests{}", plan.where_sql,
-    );
-    let (matched, running): (i64, i64) = conn.query_row(
-        &sql,
-        params_from_iter(plan.binds.iter()),
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    Ok((matched.max(0) as usize, running.max(0) as usize))
+    let matched = count_matching(conn, plan)?;
+    let running = if plan.is_running_only {
+        matched
+    } else if !plan.can_have_running {
+        0
+    } else {
+        let sql = format!("SELECT COUNT(*) FROM requests{} AND status = 0", plan.where_sql);
+        let count: i64 = conn.query_row(&sql, params_from_iter(plan.binds.iter()), |row| row.get(0))?;
+        count.max(0) as usize
+    };
+    Ok((matched, running))
 }
 
 /// 筛选下拉的候选清单：明细里出现过的模型名与 provider id（各按出现次数降序）。
@@ -498,16 +516,29 @@ pub(super) fn source_filter_options(conn: &Connection, max: usize) -> rusqlite::
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut stmt = conn.prepare(
-        "SELECT api_key_id, api_key_source, \
-         (SELECT r.api_key_name FROM requests r WHERE r.api_key_id = requests.api_key_id \
-          AND r.api_key_source = requests.api_key_source AND r.api_key_name <> '' ORDER BY r.ts DESC, r.row_id DESC LIMIT 1) \
-         FROM requests GROUP BY api_key_source, api_key_id \
-         ORDER BY COUNT(*) DESC, api_key_source, api_key_id LIMIT ?1",
+        "SELECT grouped.api_key_id, grouped.api_key_source, \
+         CASE WHEN grouped.api_key_source = 'key' THEN COALESCE(r.api_key_name, '') ELSE '' END \
+         FROM ( \
+             SELECT api_key_id, api_key_source, MAX(row_id) AS latest, COUNT(*) AS n \
+             FROM requests \
+             GROUP BY api_key_source, api_key_id \
+             ORDER BY n DESC, api_key_source, api_key_id \
+             LIMIT ?1 \
+         ) grouped \
+         LEFT JOIN requests r ON grouped.api_key_source = 'key' AND r.row_id = grouped.latest \
+         ORDER BY grouped.n DESC, grouped.api_key_source, grouped.api_key_id",
     )?;
+    let live_keys = crate::server::core::api_keys::list();
     let keys = stmt.query_map(params![max as i64], |row| {
-        let identity = super::ApiKeyIdentity {
-            id: row.get(0)?, source: row.get(1)?, name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-        };
+        let id: String = row.get(0)?;
+        let source: String = row.get(1)?;
+        let mut name: String = row.get(2)?;
+        if source == "key" && name.is_empty() {
+            if let Some(entry) = live_keys.iter().find(|k| k.id == id) {
+                name = entry.name.clone();
+            }
+        }
+        let identity = super::ApiKeyIdentity { id, source, name };
         Ok(serde_json::json!({ "value": identity.filter_value(), "label": super::source_report::key_label(&identity) }))
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut clients: Vec<Value> = clients.into_iter().filter(|(client, _)| !client.is_empty()).map(|(client, label)| serde_json::json!({

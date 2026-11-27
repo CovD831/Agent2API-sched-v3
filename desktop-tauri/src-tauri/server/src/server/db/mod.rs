@@ -140,10 +140,75 @@ pub struct Db {
     inner: Arc<DbInner>,
 }
 
+struct ReadPool {
+    file: PathBuf,
+    idle: Mutex<Vec<Connection>>,
+    max_idle: usize,
+}
+
+impl ReadPool {
+    fn new(file: PathBuf, max_idle: usize) -> Self {
+        Self {
+            file,
+            idle: Mutex::new(Vec::with_capacity(max_idle)),
+            max_idle,
+        }
+    }
+
+    fn acquire(&self) -> Option<Connection> {
+        if self.file.as_os_str().is_empty() || self.file == Path::new(":memory:") {
+            return None;
+        }
+        {
+            let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(conn) = idle.pop() {
+                return Some(conn);
+            }
+        }
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(&self.file, flags).ok()?;
+        if apply_read_pragmas(&conn).is_err() {
+            return None;
+        }
+        Some(conn)
+    }
+
+    fn recycle(&self, conn: Connection) {
+        if !conn.is_autocommit() {
+            return;
+        }
+        let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.len() < self.max_idle {
+            idle.push(conn);
+        }
+    }
+
+    fn clear_idle(&self) {
+        let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        idle.clear();
+    }
+}
+
+struct PooledReader<'a> {
+    pool: &'a ReadPool,
+    conn: Option<Connection>,
+}
+
+impl Drop for PooledReader<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool.recycle(conn);
+        }
+    }
+}
+
 struct DbInner {
     /// 单连接。锁中毒时按「数据库不可用」处理，**不用** `into_inner()` 接管 ——
     /// 与 `core::egress` / `logs_store` 的取向不同，理由见 `with` 的注释。
     conn: Mutex<credential_epoch::ConnectionState>,
+    /// WAL 模式下的只读连接池，供纯读查询并发使用而不阻塞于写锁。
+    readers: ReadPool,
     /// 仅在短事务无法确认已结束或无法恢复连接设置时隔离；所有访问须在conn锁内检查。
     task_guard_unusable: AtomicBool,
     /// 库文件路径（打开时确定，之后不变）
@@ -186,11 +251,13 @@ impl Db {
         let requests = Arc::new(AtomicU64::new(0));
         let usage = Arc::new(AtomicU64::new(0));
         install_cloud_sync_hook(&conn, accounts.clone(), requests.clone(), usage.clone());
+        let file = path.to_path_buf();
         Ok(Db {
             inner: Arc::new(DbInner {
                 conn: Mutex::new(credential_epoch::ConnectionState::new(conn)),
+                readers: ReadPool::new(file.clone(), 4),
                 task_guard_unusable: AtomicBool::new(false),
-                file: path.to_path_buf(),
+                file,
                 accounts,
                 requests,
                 usage,
@@ -257,6 +324,31 @@ impl Db {
             }
             Err(_) => None,
         }
+    }
+
+    /// 使用 WAL 只读连接池执行纯读操作，不争抢主连接写锁。
+    /// 若只读连接打开失败（如 `:memory:` 库），则保守回落到 `with_mut`。
+    pub fn with_read<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> Option<T> {
+        if self.inner.task_guard_unusable.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Some(conn) = self.inner.readers.acquire() {
+            let mut guard = PooledReader {
+                pool: &self.inner.readers,
+                conn: Some(conn),
+            };
+            if self.inner.task_guard_unusable.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(conn) = guard.conn.as_mut() {
+                return Some(f(conn));
+            }
+        }
+        self.with_mut(f)
+    }
+
+    pub(crate) fn clear_read_pool(&self) {
+        self.inner.readers.clear_idle();
     }
 
     pub(crate) fn request_revision(&self) -> u64 {
@@ -341,9 +433,22 @@ fn apply_pragmas(conn: &Connection) -> Result<(), String> {
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;
-         PRAGMA busy_timeout=5000;",
+         PRAGMA busy_timeout=5000;
+         PRAGMA cache_size=-65536;
+         PRAGMA temp_store=MEMORY;
+         PRAGMA mmap_size=268435456;",
     )
     .map_err(|error| format!("设置数据库 PRAGMA 失败: {error}"))
+}
+
+fn apply_read_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "PRAGMA query_only=ON;
+         PRAGMA busy_timeout=5000;
+         PRAGMA cache_size=-32768;
+         PRAGMA temp_store=MEMORY;
+         PRAGMA mmap_size=268435456;",
+    )
 }
 
 /// 给主连接装云同步的变更钩子（`core::cloud_sync::auto_sync`）。
@@ -416,5 +521,62 @@ pub(crate) mod test_temp {
         pub fn path(&self) -> &Path {
             &self.path
         }
+    }
+}
+
+#[cfg(test)]
+mod read_pool_tests {
+    use super::test_temp::TempDb;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn with_read_runs_concurrently_while_write_lock_is_held() {
+        let (db, _tmp) = TempDb::open("wal-read-pool");
+        db.with_mut(|conn| {
+            conn.execute(
+                "INSERT INTO kv (key, value) VALUES ('wal_probe', 'ok')",
+                [],
+            )
+            .unwrap();
+        })
+        .unwrap();
+
+        let db_writer = Arc::new(db);
+        let db_reader = Arc::clone(&db_writer);
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let writer = std::thread::spawn(move || {
+            db_writer.with_mut(|_conn| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+        });
+
+        locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (read_tx, read_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let value = db_reader
+                .with_read(|conn| {
+                    conn.query_row(
+                        "SELECT value FROM kv WHERE key = 'wal_probe'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            let _ = read_tx.send(value);
+        });
+
+        let value = read_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("with_read 不应阻塞于主写连接锁");
+        assert_eq!(value, "ok");
+
+        let _ = release_tx.send(());
+        writer.join().unwrap();
     }
 }

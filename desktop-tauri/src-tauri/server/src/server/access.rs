@@ -122,6 +122,7 @@ static STORE_DB: OnceLock<Option<Db>> = OnceLock::new();
 /// （环境变量预置的管理员仍可登录，但会话只存在于内存里）。
 pub fn attach_db(db: Option<Db>) {
     STORE_DB.set(db).ok();
+    invalidate_admin_cache();
 }
 
 fn db() -> Option<&'static Db> {
@@ -198,23 +199,81 @@ fn env_admin() -> Option<&'static (String, String)> {
     .as_ref()
 }
 
+const ADMIN_CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+struct AdminCacheEntry {
+    generation: u64,
+    fetched_at: Instant,
+    value: Option<(String, String)>,
+}
+
+struct AdminCache(Mutex<Option<AdminCacheEntry>>);
+
+impl AdminCache {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    fn invalidate(&self) {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+
+    fn get_or_load(
+        &self,
+        generation: u64,
+        ttl: Duration,
+        loader: impl FnOnce() -> Option<Option<(String, String)>>,
+    ) -> Option<(String, String)> {
+        {
+            let guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.as_ref() {
+                if entry.generation == generation && entry.fetched_at.elapsed() < ttl {
+                    return entry.value.clone();
+                }
+            }
+        }
+        let loaded = loader()?;
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(AdminCacheEntry {
+            generation,
+            fetched_at: Instant::now(),
+            value: loaded.clone(),
+        });
+        loaded
+    }
+}
+
+static ADMIN_CACHE: OnceLock<AdminCache> = OnceLock::new();
+
+fn admin_cache() -> &'static AdminCache {
+    ADMIN_CACHE.get_or_init(AdminCache::new)
+}
+
+fn invalidate_admin_cache() {
+    admin_cache().invalidate();
+}
+
 /// 库里的注册记录（`kv` 的 `panelAdmin`：{username, hash}）。
 fn store_admin() -> Option<(String, String)> {
-    let db = db()?;
-    db.with(|conn| {
-        conn.query_row(
-            "SELECT value FROM kv WHERE key = ?1",
-            rusqlite::params![KV_ADMIN_KEY],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-    })
-    .flatten()
-    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-    .and_then(|object| {
-        let username = object.get("username")?.as_str()?.to_string();
-        let hash = object.get("hash")?.as_str()?.to_string();
-        Some((username, hash))
+    let generation = crate::server::db::query_cache_generation();
+    admin_cache().get_or_load(generation, ADMIN_CACHE_TTL, || {
+        let db = db()?;
+        db.with_read(|conn| {
+            conn.query_row(
+                "SELECT value FROM kv WHERE key = ?1",
+                rusqlite::params![KV_ADMIN_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|object| {
+                let username = object.get("username")?.as_str()?.to_string();
+                let hash = object.get("hash")?.as_str()?.to_string();
+                Some((username, hash))
+            })
+        })
     })
 }
 
@@ -264,6 +323,9 @@ pub fn setup_admin(username: &str, password_hash: &str) -> Result<bool, String> 
         })
         .and_then(|result| result.ok())
         .ok_or_else(|| "写入管理员账号失败".to_string())?;
+    if changed > 0 {
+        invalidate_admin_cache();
+    }
     Ok(changed > 0)
 }
 
@@ -306,6 +368,7 @@ pub fn change_password(
     .filter(|changed| *changed > 0)
     .ok_or_else(|| "写入新密码失败".to_string())?;
 
+    invalidate_admin_cache();
     revoke_other_sessions(headers);
     Ok(true)
 }
@@ -380,6 +443,7 @@ pub fn sync_env_admin_to_store() {
         .and_then(|result| result.ok())
         .unwrap_or(0);
     if changed > 0 {
+        invalidate_admin_cache();
         logging::log(
             "[Security]",
             "✅ 已用环境变量播种面板管理员（此后以库为准，改密码请用设置页）",
@@ -1671,5 +1735,60 @@ mod session_lifecycle_tests {
         // 两段各归各位：第一段撑 access，第二段撑轮换
         assert!(session_valid(&cookie_header(&cookie_value(&issued))));
         assert!(rotate_session(&cookie_header(&cookie_value(&issued))).is_some());
+    }
+}
+
+#[cfg(test)]
+mod admin_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn admin_cache_reuses_hits_and_respects_invalidation_and_generation() {
+        let cache = AdminCache::new();
+        let loads = AtomicUsize::new(0);
+        let ttl = Duration::from_secs(60);
+
+        let first = cache.get_or_load(1, ttl, || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Some(Some(("admin".into(), "hash-v1".into())))
+        });
+        assert_eq!(first, Some(("admin".into(), "hash-v1".into())));
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        let second = cache.get_or_load(1, ttl, || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Some(Some(("admin".into(), "hash-should-not-load".into())))
+        });
+        assert_eq!(second, Some(("admin".into(), "hash-v1".into())));
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        cache.invalidate();
+        let after_invalidate = cache.get_or_load(1, ttl, || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Some(Some(("admin".into(), "hash-v2".into())))
+        });
+        assert_eq!(after_invalidate, Some(("admin".into(), "hash-v2".into())));
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+
+        let after_generation_bump = cache.get_or_load(2, ttl, || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Some(Some(("admin".into(), "hash-v3".into())))
+        });
+        assert_eq!(
+            after_generation_bump,
+            Some(("admin".into(), "hash-v3".into()))
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 3);
+
+        // Loader returning None (DB unavailable) must not poison cache.
+        cache.invalidate();
+        assert_eq!(cache.get_or_load(2, ttl, || None), None);
+        let recovered = cache.get_or_load(2, ttl, || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Some(Some(("admin".into(), "hash-v4".into())))
+        });
+        assert_eq!(recovered, Some(("admin".into(), "hash-v4".into())));
+        assert_eq!(loads.load(Ordering::SeqCst), 4);
     }
 }

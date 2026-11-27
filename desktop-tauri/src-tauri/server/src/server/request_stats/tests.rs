@@ -370,3 +370,180 @@ fn missing_database_returns_the_same_empty_query_shape() {
         json!({"entries": [], "total": 0, "matched": 0, "running": 0})
     );
 }
+
+#[test]
+fn schema_v31_query_plans_use_targeted_covering_indexes() {
+    let (_dir, stats, now) = seed();
+
+    fn explain(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        binds: &[rusqlite::types::Value],
+    ) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows.join(" | ")
+    }
+
+    let running_plan = super::sql::FilterPlan::of(&RequestQuery {
+        status: Some("running".into()),
+        ..Default::default()
+    });
+    let error_plan = super::sql::FilterPlan::of(&RequestQuery {
+        status: Some("error".into()),
+        start: Some(0),
+        ..Default::default()
+    });
+    let provider_plan = super::sql::FilterPlan::of(&RequestQuery {
+        provider: Some("test-provider".into()),
+        ..Default::default()
+    });
+
+    let (eqp_running, eqp_error, eqp_provider, eqp_summary_rows, eqp_cache_windows) = stats
+        .with_read_conn(|conn| {
+            let eqp_running = explain(
+                conn,
+                &format!(
+                    "SELECT row_id FROM requests{} ORDER BY ts DESC, row_id DESC LIMIT 50",
+                    running_plan.where_sql_for_test()
+                ),
+                running_plan.binds_for_test(),
+            );
+            let eqp_error = explain(
+                conn,
+                &format!("SELECT COUNT(*) FROM requests{}", error_plan.where_sql_for_test()),
+                error_plan.binds_for_test(),
+            );
+            let eqp_provider = explain(
+                conn,
+                &format!(
+                    "SELECT row_id FROM requests{} ORDER BY ts DESC, row_id DESC LIMIT 50",
+                    provider_plan.where_sql_for_test()
+                ),
+                provider_plan.binds_for_test(),
+            );
+            let eqp_summary_rows = explain(
+                conn,
+                &format!(
+                    "SELECT ts, model, upstream_model, total_tokens, cache_read_tokens, prompt_tokens, \
+                     completion_tokens, (status >= 200 AND status < 300 AND error IS NULL) \
+                     FROM requests WHERE ts >= {} AND ts <= {now} AND is_test = 0 AND status <> 0",
+                    now - 86_400_000
+                ),
+                &[],
+            );
+            let eqp_cache_windows = explain(
+                conn,
+                &format!(
+                    "SELECT COALESCE(SUM(CASE WHEN ts >= {} THEN cache_read_tokens END), 0), \
+                     COALESCE(SUM(CASE WHEN ts >= {} THEN prompt_tokens END), 0) \
+                     FROM requests WHERE ts >= {} AND ts <= {now} AND is_test = 0",
+                    now - 600_000,
+                    now - 600_000,
+                    now - 7 * 86_400_000
+                ),
+                &[],
+            );
+            Ok((
+                eqp_running,
+                eqp_error,
+                eqp_provider,
+                eqp_summary_rows,
+                eqp_cache_windows,
+            ))
+        })
+        .unwrap();
+
+    assert!(
+        eqp_running.contains("idx_requests_running") && !eqp_running.contains("TEMP B-TREE"),
+        "running plan: {eqp_running}"
+    );
+    assert!(
+        eqp_error.contains("idx_requests_errors_ts"),
+        "error plan: {eqp_error}"
+    );
+    assert!(
+        eqp_provider.contains("idx_requests_provider_ts") && !eqp_provider.contains("TEMP B-TREE"),
+        "provider plan: {eqp_provider}"
+    );
+    assert!(
+        eqp_summary_rows.contains("COVERING INDEX idx_requests_summary"),
+        "summary_rows plan: {eqp_summary_rows}"
+    );
+    assert!(
+        eqp_cache_windows.contains("COVERING INDEX idx_requests_summary"),
+        "cache_windows plan: {eqp_cache_windows}"
+    );
+}
+
+#[test]
+fn usage_summary_and_today_count_include_unflushed_daily_buffer_while_writer_locked() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    let (_dir, stats) = temp_stats();
+    let stats = Arc::new(stats);
+    let now = crate::server::logging::now_ms();
+    stats.record(entry("buffered-1", now));
+
+    let writer_stats = Arc::clone(&stats);
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let db = writer_stats.db.as_ref().unwrap();
+        db.with_mut(|_| {
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+    });
+
+    locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let reader_stats = Arc::clone(&stats);
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let count = reader_stats.today_request_count();
+        let summary = reader_stats.usage_summary("today", None, None);
+        let _ = done_tx.send((count, summary));
+    });
+
+    let (count, summary) = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("usage_summary 与 today_request_count 不应等待主写锁");
+    assert_eq!(count["overview"]["requests"], 1);
+    assert_eq!(summary["overview"]["requests"], 1);
+    assert_eq!(summary["overview"]["tokens"], 10);
+
+    let _ = release_tx.send(());
+    writer.join().unwrap();
+}
+
+#[test]
+fn source_filter_options_formats_all_key_sources_accurately() {
+    let (_dir, stats) = temp_stats();
+    let now = crate::server::logging::now_ms();
+    for (i, key) in ["key:alpha", "env", "none", "unknown"].iter().enumerate() {
+        let mut item = entry(&format!("k-{i}"), now + i as i64);
+        item.source = source("zcode", key);
+        if *key == "key:alpha" {
+            item.source.api_key.name = "Alpha Key".into();
+        }
+        stats.record(item);
+    }
+    let filters = stats.filter_options();
+    let keys = filters["apiKeys"].as_array().unwrap();
+    let map: std::collections::HashMap<_, _> = keys
+        .iter()
+        .map(|k| (k["value"].as_str().unwrap(), k["label"].as_str().unwrap()))
+        .collect();
+    assert_eq!(map.get("key:alpha").copied(), Some("Alpha Key"));
+    assert_eq!(map.get("env").copied(), Some("环境变量 Key"));
+    assert_eq!(map.get("none").copied(), Some("免鉴权调用"));
+    assert_eq!(map.get("unknown").copied(), Some("历史未记录 Key"));
+}
