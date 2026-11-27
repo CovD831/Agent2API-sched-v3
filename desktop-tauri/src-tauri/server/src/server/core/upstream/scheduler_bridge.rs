@@ -165,10 +165,14 @@ impl GatewayScheduler {
 
         // Derive provider priority tiers in O(N) without cloning JSON Values, matching `account_order::manual_groups`:
         // each provider's queue position is determined by the minimum `(priority, addedAt)` among its accounts.
+        let mut visible_cache: HashMap<&str, bool> = HashMap::new();
         let mut provider_min_key: HashMap<&str, (i64, i64)> = HashMap::new();
         for acc in &snapshot.accounts {
             let provider = routing::provider_of(acc);
-            if !crate::server::core::account_store::store_view::account_visible(provider) {
+            let visible = *visible_cache
+                .entry(provider)
+                .or_insert_with(|| crate::server::core::account_store::store_view::account_visible(provider));
+            if !visible {
                 continue;
             }
             let prio = acc.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX);
@@ -198,7 +202,7 @@ impl GatewayScheduler {
                 continue;
             };
             let provider = routing::provider_of(acc);
-            if !crate::server::core::account_store::store_view::account_visible(provider) {
+            if !visible_cache.get(provider).copied().unwrap_or(false) {
                 continue;
             }
             let enabled = acc.get("enabled").and_then(Value::as_bool) != Some(false);

@@ -18,6 +18,7 @@ struct CachedSnapshot {
     beijing_day: String,
     checked_at: Instant,
     rows: Arc<BTreeMap<i64, Arc<Value>>>,
+    route_rows: Arc<BTreeMap<i64, Arc<Value>>>,
     snapshot: Arc<RoutingSnapshot>,
 }
 
@@ -29,16 +30,20 @@ pub(crate) struct RoutingSnapshot {
     pub public_by_id: HashMap<String, Arc<Value>>,
     pub available_providers: HashSet<String>,
     pub forwarding_providers: HashSet<String>,
+    pub(crate) projected_build: std::sync::Mutex<()>,
     pub(crate) projected_routes: std::sync::Mutex<HashMap<String, Arc<crate::server::core::upstream::route_context::ProjectedRoute>>>,
 }
 
 impl RoutingSnapshot {
-    fn from_rows(rows: &BTreeMap<i64, Arc<Value>>) -> Self {
+    fn from_rows(
+        rows: &BTreeMap<i64, Arc<Value>>,
+        route_rows: &BTreeMap<i64, Arc<Value>>,
+    ) -> Self {
         let public_accounts: Vec<_> = rows.values().cloned().collect();
         let public_by_id = public_accounts.iter().filter_map(|account| {
             Some((account.get("id")?.as_str()?.to_string(), account.clone()))
         }).collect();
-        let accounts: Vec<_> = public_accounts.iter().map(|account| Arc::new(route_account(account))).collect();
+        let accounts: Vec<_> = route_rows.values().cloned().collect();
         let by_id = accounts.iter().filter_map(|account| {
             Some((account.get("id")?.as_str()?.to_string(), account.clone()))
         }).collect();
@@ -63,6 +68,7 @@ impl RoutingSnapshot {
             public_by_id,
             available_providers,
             forwarding_providers,
+            projected_build: std::sync::Mutex::new(()),
             projected_routes: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -116,14 +122,20 @@ impl AccountStore {
         let today_day = crate::server::core::beijing::today_key();
         if let Some(snapshot) = fresh(cache, db.account_revision(), metadata, &today_day) { return snapshot; }
         let previous = cache.state.read().ok().and_then(|state| state.as_ref().map(|cached| {
-            (cached.revision, cached.metadata, cached.beijing_day.clone(), cached.rows.clone())
+            (
+                cached.revision,
+                cached.metadata,
+                cached.beijing_day.clone(),
+                cached.rows.clone(),
+                cached.route_rows.clone(),
+            )
         }));
         // 0027：不再依赖全库 PRAGMA data_version（requests 表写入会令其持续失效导致反复全量解密），
         // 仅依赖 accounts 表专属的 account_revision + 行级 update_hook journal。
         let batch = db.with(|conn| -> rusqlite::Result<_> {
-            let since = previous.as_ref().filter(|(_, old_metadata, old_day, _)| {
+            let since = previous.as_ref().filter(|(_, old_metadata, old_day, _, _)| {
                 *old_metadata == metadata && *old_day == today_day
-            }).map(|(revision, _, _, _)| *revision);
+            }).map(|(revision, _, _, _, _)| *revision);
             let changes = db.account_changes(since);
             let (replace, rows, unchanged) = match changes.rows {
                 Some(ids) => {
@@ -144,15 +156,25 @@ impl AccountStore {
                 }
             }
         }
-        let mut rows = if replace { BTreeMap::new() } else {
-            previous.map(|(_, _, _, rows)| (*rows).clone()).unwrap_or_default()
+        let (mut rows, mut route_rows) = if replace {
+            (BTreeMap::new(), BTreeMap::new())
+        } else {
+            previous
+                .map(|(_, _, _, rows, route_rows)| ((*rows).clone(), (*route_rows).clone()))
+                .unwrap_or_default()
         };
         let mut failed = 0;
         for (rowid, raw) in changes {
             rows.remove(&rowid);
+            route_rows.remove(&rowid);
             if let Some(raw) = raw {
                 match read_rows::decode(raw) {
-                    Ok((_, record)) => { rows.insert(rowid, Arc::new(self.public_account(&record))); }
+                    Ok((_, record)) => {
+                        let public = Arc::new(self.public_account(&record));
+                        let route = Arc::new(route_account(&public));
+                        rows.insert(rowid, public);
+                        route_rows.insert(rowid, route);
+                    }
                     Err(_) => failed += 1,
                 }
             }
@@ -160,7 +182,7 @@ impl AccountStore {
         if failed > 0 {
             super::sql::warn_load_failure("读取选路账号", &format!("{failed} 条账号记录解密或解析失败，已跳过；原始数据未修改"));
         }
-        let snapshot = Arc::new(RoutingSnapshot::from_rows(&rows));
+        let snapshot = Arc::new(RoutingSnapshot::from_rows(&rows, &route_rows));
         // 0027：按构建取数时的 revision 入缓存，不再因构建期间新到变更作废整批成果。
         if let Ok(mut state) = cache.state.write() {
             *state = Some(CachedSnapshot {
@@ -169,6 +191,7 @@ impl AccountStore {
                 beijing_day: today_day,
                 checked_at: Instant::now(),
                 rows: Arc::new(rows),
+                route_rows: Arc::new(route_rows),
                 snapshot: snapshot.clone(),
             });
         }
@@ -205,7 +228,7 @@ fn cached_snapshot(cache: &SnapshotCache) -> Option<Arc<RoutingSnapshot>> {
 }
 
 fn empty() -> Arc<RoutingSnapshot> {
-    Arc::new(RoutingSnapshot::from_rows(&BTreeMap::new()))
+    Arc::new(RoutingSnapshot::from_rows(&BTreeMap::new(), &BTreeMap::new()))
 }
 
 // 选路只消费所需字段；完整公开投影复用同一份按账号增量更新的缓存。
@@ -222,4 +245,58 @@ fn route_account(account: &Value) -> Value {
     let source = account.pointer("/proxy/config/source").and_then(Value::as_str).unwrap_or("");
     public.insert("proxy".to_string(), json!({ "config": { "source": source } }));
     Value::Object(public)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::server::{config, core::account_store::AccountStore, db::Db};
+
+    #[test]
+    fn incremental_route_rows_match_full_rebuild_across_mutations() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::incremental_route_rows_match_full_rebuild_across_mutations"),
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = Db::open(&dir.path().join("snapshot-inc.db")).unwrap();
+                config::init(Some(db.clone()));
+                let store = AccountStore::with_db(Some(db.clone()));
+
+                let a1 = store
+                    .add_custom_account("custom-p1", &json!({"apiKey": "sk-1"}), Some("A1"))
+                    .unwrap()
+                    .account;
+                let id1 = a1["id"].as_str().unwrap().to_string();
+                let a2 = store
+                    .add_custom_account("custom-p1", &json!({"apiKey": "sk-2"}), Some("A2"))
+                    .unwrap()
+                    .account;
+                let id2 = a2["id"].as_str().unwrap().to_string();
+
+                let assert_matches = |label: &str| {
+                    let cached = store.routing_snapshot_fresh();
+                    let fresh_store = AccountStore::with_db(Some(db.clone()));
+                    let rebuilt = fresh_store.routing_snapshot_fresh();
+                    assert_eq!(cached.accounts, rebuilt.accounts, "{label} accounts");
+                    assert_eq!(cached.by_id, rebuilt.by_id, "{label} by_id");
+                    assert_eq!(cached.by_provider, rebuilt.by_provider, "{label} by_provider");
+                };
+
+                assert_matches("initial");
+                store
+                    .update_account(
+                        &id1,
+                        &json!({
+                            "priority": 5,
+                            "rateLimits": { "gpt-test": { "resetAt": i64::MAX / 2 } }
+                        }),
+                    )
+                    .unwrap();
+                assert_matches("updated priority & rateLimits");
+                store.remove_account(&id2).unwrap();
+                assert_matches("removed");
+            },
+        );
+    }
 }

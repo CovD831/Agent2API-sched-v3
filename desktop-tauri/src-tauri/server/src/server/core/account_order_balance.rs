@@ -15,6 +15,14 @@ pub struct AccountSortBalance {
     pub unlimited: bool,
 }
 
+impl PartialEq for AccountSortBalance {
+    fn eq(&self, other: &Self) -> bool {
+        self.remaining.map(f64::to_bits) == other.remaining.map(f64::to_bits)
+            && self.unit == other.unit
+            && self.unlimited == other.unlimited
+    }
+}
+
 impl AccountSortBalance {
     pub fn from_usage(usage: &Value) -> Self {
         let (remaining, unlimited) = usage_records::extract_remaining(usage);

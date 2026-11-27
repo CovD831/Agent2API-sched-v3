@@ -104,6 +104,7 @@ struct Inner {
     pub(super) cache: super::snapshot::SnapshotCache,
     pub(super) record_cache: std::sync::RwLock<super::read_state::RecordCache>,
     pub(super) catalog_cache: super::catalog_cache::CatalogCache,
+    pub(super) policy_cooldown_cache: std::sync::RwLock<Option<(Arc<Value>, std::time::Instant)>>,
     instance_id: u64,
     validation: Mutex<Option<crate::server::core::providers::catalog::ValidationCache>>,
     /// SQLite 句柄。`None` = 数据库打开失败（启动时已记日志）。
@@ -161,6 +162,7 @@ impl AccountStore {
                 cache: Default::default(),
                 record_cache: Default::default(),
                 catalog_cache: Default::default(),
+                policy_cooldown_cache: Default::default(),
                 instance_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
                 validation: Mutex::new(None),
             }),
@@ -205,6 +207,12 @@ impl AccountStore {
 
     pub(super) fn catalog_cache(&self) -> &super::catalog_cache::CatalogCache {
         &self.inner.catalog_cache
+    }
+
+    pub(super) fn policy_cooldown_cache(
+        &self,
+    ) -> &std::sync::RwLock<Option<(Arc<Value>, std::time::Instant)>> {
+        &self.inner.policy_cooldown_cache
     }
 
     /// 账号数据是否已落盘（Node 版账号存储导出的

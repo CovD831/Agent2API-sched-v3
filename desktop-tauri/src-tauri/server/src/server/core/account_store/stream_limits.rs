@@ -73,11 +73,15 @@ impl StreamLimitSource {
             let guard = self.store.guard();
             if stopped(deadline, worker_cancel.as_deref(), &abandoned) { return Err(unavailable()); }
             let db = self.store.database().ok_or_else(unavailable)?;
-            self.store.with_conn_mut(&guard, |conn| Ok(stream_limits::apply(conn, self.stamp, status, code,
+            let result = self.store.with_conn_mut(&guard, |conn| Ok(stream_limits::apply(conn, self.stamp, status, code,
                 reset_at, &message, &rule, scope, floor_ms, deadline, worker_cancel.as_deref(), &abandoned, |rowid| {
                     let changes = db.account_changes(Some(self.revision));
                     changes.revision >= self.revision && changes.rows.is_some_and(|rows| !rows.contains(&rowid))
-                }))).map_err(|_| unavailable())?
+                }))).map_err(|_| unavailable())?;
+            if scope == CooldownScope::Provider {
+                self.store.invalidate_policy_cooldown_cache();
+            }
+            result
         });
         let cancelled = async { match cancel { Some(token) => token.cancelled().await, None => std::future::pending().await } };
         tokio::select! {

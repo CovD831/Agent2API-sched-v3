@@ -27,9 +27,13 @@ impl AccountStore {
         let mut current_ids = Map::new();
         let mut current: Option<std::sync::Arc<Value>> = None;
         let mut visible = Vec::new();
+        let mut visible_cache: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
         for account in &cached.public_accounts {
             let provider = routing::provider_of(account);
-            if !account_list_visible(provider, booting) {
+            let list_visible = *visible_cache
+                .entry(provider)
+                .or_insert_with(|| account_list_visible(provider, booting));
+            if !list_visible {
                 if include_summary {
                     *hidden.entry(provider.to_string()).or_insert(0usize) += 1;
                 }
@@ -57,14 +61,11 @@ impl AccountStore {
                 current = Some(account.clone());
             }
         }
-        let route_accounts = visible.iter().map(|account| {
-            let mut fields = Map::new();
-            for key in ["id", "provider", "priority", "addedAt", "isGuest", "usageConfigKey"] {
-                if let Some(value) = account.get(key) { fields.insert(key.to_string(), value.clone()); }
-            }
-            Value::Object(fields)
-        }).collect::<Vec<_>>();
-        let sorting = account_order::sorting(&route_accounts, now);
+        let sort_entries: Vec<account_order::SortAccount<'_>> = visible
+            .iter()
+            .map(|account| account_order::SortAccount::from_value(account))
+            .collect();
+        let sorting = account_order::sorting_lightweight(&sort_entries, now);
         if !include_summary {
             return json!({ "sorting": sorting });
         }
