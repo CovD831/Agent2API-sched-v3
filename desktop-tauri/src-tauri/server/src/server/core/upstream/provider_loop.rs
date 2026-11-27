@@ -617,6 +617,46 @@ fn filter_by_key_scope(
 
 /// 账号循环：每一轮从候选池里按全局优先级选一个账号，用它所属家的适配器发一次。
 ///
+fn is_plugin_unavailable_error(error: &GatewayError) -> bool {
+    error.code.as_deref() == Some("plugin_unavailable")
+        || (error.status_code == 503 && error.message.contains("提供商插件当前不可用"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_skip_unavailable_provider(
+    service: &UpstreamService,
+    ctx: &ProviderContext<'_>,
+    provider_ids: &[&str],
+    cooldown_keys: &rotate::CooldownKeys<'_>,
+    failed_provider: &str,
+    error: &GatewayError,
+    tried_ids: &mut Vec<String>,
+    switches_left: &mut usize,
+    switch_total: usize,
+) -> bool {
+    if !is_plugin_unavailable_error(error)
+        || ctx.telemetry.response_started()
+        || ctx.pinned_account.is_some()
+    {
+        return false;
+    }
+    super::error_policy::exclude_provider(
+        service,
+        provider_ids,
+        cooldown_keys.request_model(),
+        failed_provider,
+        tried_ids,
+        ctx.pinned_account,
+        &ctx.routing,
+    );
+    if !take_switch(switches_left, switch_total) {
+        return false;
+    }
+    ctx.telemetry
+        .note_attempt_notice("提供商插件当前不可用，已跳过该提供商切换备选渠道");
+    true
+}
+
 /// 按 `is_stateful` 分流（架构文档 §4.2.1）：
 ///   - 无状态（workbuddy / 小浣熊 / AutoClaw）→ 下面这段「构造请求 → 发送 →
 ///     按分类动作」；
@@ -738,7 +778,9 @@ async fn attempt_queue(
             Ok(target) => target,
             Err(err) => {
                 if let Some(prev) = last_error.take() {
-                    if prev.code.as_deref() == Some("ttft_deadline_exceeded") {
+                    if prev.code.as_deref() == Some("ttft_deadline_exceeded")
+                        || is_plugin_unavailable_error(&prev)
+                    {
                         return Err(prev);
                     }
                 }
@@ -899,6 +941,7 @@ async fn attempt_queue(
                         &model,
                         &conv_key,
                         sticky_ttl_ms,
+                        failed_target.attempt_deadline_ms,
                         &error,
                     );
                     if error.code.as_deref() == Some("ttft_deadline_exceeded")
@@ -913,6 +956,20 @@ async fn attempt_queue(
                             last_error = Some(error);
                             continue 'accounts;
                         }
+                    }
+                    if try_skip_unavailable_provider(
+                        service,
+                        ctx,
+                        provider_ids,
+                        &cooldown_keys,
+                        &failed_target.provider,
+                        &error,
+                        &mut tried_ids,
+                        &mut switches_left,
+                        switch_total,
+                    ) {
+                        last_error = Some(error);
+                        continue 'accounts;
                     }
                     if matches!(error.code.as_deref(), Some("plugin_busy" | "gateway_busy" | "account_busy" | "plugin_resource_limit"
                         | "plugin_protocol_error" | "plugin_trap" | "plugin_response_started" | "web_tools_invalid_request")) { return Err(error); }
@@ -1572,6 +1629,7 @@ async fn attempt_queue(
                         &model,
                         &conv_key,
                         sticky_ttl_ms,
+                        target.attempt_deadline_ms,
                         &failure.error,
                     );
                     if matches!(failure.class, UpstreamErrorClass::TokenExpired { .. })
@@ -1622,6 +1680,20 @@ async fn attempt_queue(
                             last_error = Some(error);
                             continue 'accounts;
                         }
+                    }
+                    if try_skip_unavailable_provider(
+                        service,
+                        ctx,
+                        provider_ids,
+                        &cooldown_keys,
+                        &target.provider,
+                        &error,
+                        &mut tried_ids,
+                        &mut switches_left,
+                        switch_total,
+                    ) {
+                        last_error = Some(error);
+                        continue 'accounts;
                     }
                     if super::error_policy_finish::finish_failure(service, ctx, provider_ids, &cooldown_keys,
                         &target, &mut error, &mut tried_ids, &mut switches_left, switch_total) {

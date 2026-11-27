@@ -562,6 +562,7 @@ pub(super) fn report_attempt_failure(
     request_model: &str,
     conv_key: &str,
     sticky_ttl_ms: i64,
+    attempt_deadline_ms: Option<u64>,
     error: &GatewayError,
 ) -> HostAction {
     let Some(node_id) = account_id.filter(|id| !id.is_empty()) else {
@@ -570,7 +571,9 @@ pub(super) fn report_attempt_failure(
     let now_ms = logging::now_ms();
     let msg = error.message.as_str();
     let kind = if error.code.as_deref() == Some("ttft_deadline_exceeded") {
-        AttemptFeedbackKind::TtftTimeout { elapsed_ms: 20_000 }
+        AttemptFeedbackKind::TtftTimeout {
+            elapsed_ms: attempt_deadline_ms.unwrap_or(20_000),
+        }
     } else if is_dead_account_error(error.status_code, msg) {
         AttemptFeedbackKind::CredentialDead {
             reason: msg.chars().take(160).collect(),
@@ -693,6 +696,8 @@ fn is_dead_account_error(status: i32, msg: &str) -> bool {
         "refresh token is invalid",
         "invalid_grant",
         "authorization_verify_error",
+        "TM.00001005",
+        "Account banned",
     ];
     if DEAD_MARKERS.iter().any(|m| msg.contains(m)) {
         return true;
@@ -768,5 +773,18 @@ impl SchedulerSettleContext {
             });
         }
         let _ = QuotaBand::Full;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_dead_account_error;
+
+    #[test]
+    fn tm_00001005_account_banned_is_classified_as_dead_account() {
+        assert!(is_dead_account_error(
+            403,
+            r#"CodeArts 上游返回 HTTP 403：{"text":"[DONE]","error_code":"TM.00001005","error_msg":"Account banned"}"#
+        ));
     }
 }

@@ -202,6 +202,7 @@ pub struct Scheduler<P: SchedulingPolicy = HysteresisLoadBalancePolicy> {
     arena: RwLock<ArenaIndex>,
     sticky: ShardedStickyTable,
     wave_guard: WaveGuard,
+    provider_ttft: RwLock<HashMap<String, f64>>,
     policy: RwLock<P>,
     config: RwLock<SchedulerConfig>,
     rr_cursor: AtomicU64,
@@ -232,6 +233,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             arena: RwLock::new(ArenaIndex::default()),
             sticky,
             wave_guard: WaveGuard::new(),
+            provider_ttft: RwLock::new(HashMap::new()),
             policy: RwLock::new(policy),
             config: RwLock::new(config),
             rr_cursor: AtomicU64::new(0),
@@ -509,6 +511,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                         .wave_guard
                         .is_provider_degraded(prov, req.now_ms, &cfg.health)
                         || is_slow,
+                    provider_ewma_ttft_ms: self.get_provider_ttft(prov),
                     ..Default::default()
                 },
             );
@@ -996,6 +999,9 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 credit_used,
                 ..
             } => {
+                if let Some(ms) = ttft_ms.filter(|&ms| ms > 0) {
+                    self.update_provider_ttft(&provider, ms as f64, cfg.health.ttft_ewma_alpha);
+                }
                 {
                     let mut h = slot.health.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(ms) = ttft_ms.filter(|&ms| ms >= cfg.health.slow_ttft_threshold_ms) {
@@ -1044,6 +1050,13 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             }
 
             AttemptFeedbackKind::TtftTimeout { elapsed_ms } => {
+                if elapsed_ms > 0 {
+                    self.update_provider_ttft(
+                        &provider,
+                        elapsed_ms as f64,
+                        cfg.health.ttft_ewma_alpha,
+                    );
+                }
                 let wave = self.wave_guard.observe_slow_timeout(
                     &provider,
                     &slot.id,
@@ -1318,6 +1331,25 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             || req.allowed_providers.contains(&meta.provider.as_str())
     }
 
+    fn update_provider_ttft(&self, provider: &str, sample_ms: f64, alpha: f64) {
+        if provider.is_empty() || sample_ms <= 0.0 || !sample_ms.is_finite() {
+            return;
+        }
+        let alpha = alpha.clamp(0.01, 1.0);
+        let mut map = self.provider_ttft.write().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(provider.to_string()).or_insert(sample_ms);
+        *entry = (1.0 - alpha) * *entry + alpha * sample_ms;
+    }
+
+    fn get_provider_ttft(&self, provider: &str) -> f64 {
+        self.provider_ttft
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(provider)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
     fn snapshot_slot_views<'a>(
         &self,
         _arena: &ArenaIndex,
@@ -1361,6 +1393,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 || self
                     .wave_guard
                     .is_provider_slow_degraded(&meta.provider, now_ms, health_cfg),
+            provider_ewma_ttft_ms: self.get_provider_ttft(&meta.provider),
             ..Default::default()
         };
         (view, prov_view)
@@ -2012,5 +2045,134 @@ mod tests {
             scheduler.schedule(&req_retry).unwrap_err(),
             RejectReason::AllCoolingDown { .. }
         ));
+    }
+
+    #[test]
+    fn cold_account_on_slow_provider_does_not_beat_warm_fast_provider() {
+        let scheduler = Scheduler::default();
+        let mut fast = NodeDescriptor::new("fast-0", "autoclaw");
+        fast.priority_tier = 0;
+        let mut slow_warm = NodeDescriptor::new("slow-0", "loomy");
+        slow_warm.priority_tier = 0;
+        let mut slow_cold = NodeDescriptor::new("slow-1", "loomy");
+        slow_cold.priority_tier = 0;
+        scheduler.sync_nodes(&[fast, slow_warm, slow_cold], 1_000);
+
+        scheduler.record_feedback(AttemptFeedback {
+            node_id: "fast-0".into(),
+            model: "m".into(),
+            sticky_key: String::new(),
+            sticky_ttl_ms: 0,
+            kind: AttemptFeedbackKind::Success {
+                ttft_ms: Some(12_000),
+                total_ms: 14_000,
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                cached_tokens: 0,
+                credit_used: None,
+            },
+            now_ms: 2_000,
+        });
+        scheduler.record_feedback(AttemptFeedback {
+            node_id: "slow-0".into(),
+            model: "m".into(),
+            sticky_key: String::new(),
+            sticky_ttl_ms: 0,
+            kind: AttemptFeedbackKind::Success {
+                ttft_ms: Some(24_000),
+                total_ms: 26_000,
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                cached_tokens: 0,
+                credit_used: None,
+            },
+            now_ms: 2_500,
+        });
+
+        let providers = ["loomy", "autoclaw"];
+        let req = ScheduleRequest {
+            model: "m",
+            allowed_providers: &providers,
+            sticky_key: "",
+            sticky_ttl_ms: 0,
+            excluded_node_ids: &[],
+            route_excluded_ids: None,
+            route_allowed_ids: None,
+            pinned_node_id: None,
+            attempt_index: 0,
+            now_ms: 3_000,
+        };
+        for _ in 0..8 {
+            let (dec, lease) = scheduler
+                .schedule(&req)
+                .expect("should pick verified faster provider over cold/slow provider");
+            assert_eq!(dec.provider, "autoclaw");
+            assert_eq!(dec.node_id, "fast-0");
+            drop(lease);
+        }
+    }
+
+    #[test]
+    fn adaptive_ttft_deadline_tightens_for_fast_provider_without_shrinking_below_floor() {
+        let scheduler = Scheduler::default();
+        scheduler.sync_nodes(&[NodeDescriptor::new("l0", "loomy")], 1_000);
+
+        let providers = ["loomy"];
+        let req = ScheduleRequest {
+            model: "m",
+            allowed_providers: &providers,
+            sticky_key: "",
+            sticky_ttl_ms: 0,
+            excluded_node_ids: &[],
+            route_excluded_ids: None,
+            route_allowed_ids: None,
+            pinned_node_id: None,
+            attempt_index: 0,
+            now_ms: 2_000,
+        };
+        let (d_cold, l_cold) = scheduler.schedule(&req).unwrap();
+        assert_eq!(d_cold.attempt_ttft_deadline_ms, 35_000);
+        drop(l_cold);
+
+        // Ultra-fast TTFT (2_000ms) -> 2_000 * 2.5 + 8_000 = 13_000 -> clamped to 15_000 floor.
+        scheduler.record_feedback(AttemptFeedback {
+            node_id: "l0".into(),
+            model: "m".into(),
+            sticky_key: String::new(),
+            sticky_ttl_ms: 0,
+            kind: AttemptFeedbackKind::Success {
+                ttft_ms: Some(2_000),
+                total_ms: 3_000,
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                cached_tokens: 0,
+                credit_used: None,
+            },
+            now_ms: 3_000,
+        });
+        let (d_floor, l_floor) = scheduler.schedule(&req).unwrap();
+        assert_eq!(d_floor.attempt_ttft_deadline_ms, 15_000);
+        drop(l_floor);
+
+        // Fresh scheduler with 6_000ms EWMA -> 6_000 * 2.5 + 8_000 = 23_000 (tighter than 35_000 base).
+        let scheduler2 = Scheduler::default();
+        scheduler2.sync_nodes(&[NodeDescriptor::new("l1", "loomy")], 1_000);
+        scheduler2.record_feedback(AttemptFeedback {
+            node_id: "l1".into(),
+            model: "m".into(),
+            sticky_key: String::new(),
+            sticky_ttl_ms: 0,
+            kind: AttemptFeedbackKind::Success {
+                ttft_ms: Some(6_000),
+                total_ms: 9_000,
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                cached_tokens: 0,
+                credit_used: None,
+            },
+            now_ms: 2_000,
+        });
+        let (d_mid, _l_mid) = scheduler2.schedule(&req).unwrap();
+        assert_eq!(d_mid.attempt_ttft_deadline_ms, 23_000);
     }
 }

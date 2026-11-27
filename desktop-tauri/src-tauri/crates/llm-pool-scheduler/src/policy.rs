@@ -104,7 +104,7 @@ impl SchedulingPolicy for HysteresisLoadBalancePolicy {
         &self,
         node: &NodeRuntimeView<'_>,
         provider: &ProviderRuntimeView,
-        req: &ScheduleRequest<'_>,
+        _req: &ScheduleRequest<'_>,
         is_sticky_hit: bool,
     ) -> Option<f64> {
         if matches!(node.health, HealthState::Quarantined | HealthState::SlowCooldown | HealthState::TempBackoff) {
@@ -124,17 +124,19 @@ impl SchedulingPolicy for HysteresisLoadBalancePolicy {
             return None;
         }
 
+        const LATENCY_REF_MS: f64 = 15_000.0;
         let cap = node.max_concurrent.max(4) as f64;
         let util = (node.inflight as f64 + 1.0) / cap;
-        let deadline = self
-            .attempt_ttft_deadline_ms(node, provider, req.attempt_index)
-            .max(1_000) as f64;
-        let norm_ttft = if node.ewma_ttft_ms > 0.0 {
-            (node.ewma_ttft_ms / deadline).min(3.0)
+        let eff_ttft_ms = if node.ewma_ttft_ms > 0.0 {
+            node.ewma_ttft_ms
+        } else if provider.provider_ewma_ttft_ms > 0.0 {
+            // Cold accounts inherit 90% of provider EWMA TTFT: keeps intra-provider warm-up preference
+            // while preventing cold slots on slow providers from beating verified fast providers.
+            provider.provider_ewma_ttft_ms * 0.90
         } else {
-            // Unobserved cold account gets a true optimistic prior so unused pool accounts warm up smoothly.
             0.0
         };
+        let norm_ttft = (eff_ttft_ms / LATENCY_REF_MS).min(4.0);
         let quota_penalty = if is_sticky_hit {
             0.0
         } else {
@@ -170,11 +172,18 @@ impl SchedulingPolicy for HysteresisLoadBalancePolicy {
             .get(&provider.provider)
             .copied()
             .unwrap_or(self.config.default_ttft_deadline_ms);
+        let effective_base = if provider.provider_ewma_ttft_ms > 0.0 && !provider.wave_degraded {
+            ((provider.provider_ewma_ttft_ms * 2.5 + 8_000.0) as u64).clamp(15_000.min(base), base)
+        } else {
+            base
+        };
         // Slightly relax deadline on final fallback attempt to avoid premature abort when all fast channels failed.
         if attempt_index == 0 {
-            base
+            effective_base
         } else {
-            base.saturating_add(u64::from(attempt_index) * 5_000).min(60_000)
+            effective_base
+                .saturating_add(u64::from(attempt_index) * 5_000)
+                .min(60_000)
         }
     }
 }
