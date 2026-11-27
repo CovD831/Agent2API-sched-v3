@@ -897,13 +897,17 @@ pub fn set_models(id: &str, models: Value, mappings: Value) -> Result<Value, Gat
 ///
 /// 性能：单次 `read_items()` 遍历（配置是进程级快照，无磁盘 IO）；
 /// 转发热路径每请求调用一两次，无需缓存。
-pub fn carriers_of_model(name: &str) -> Vec<String> {
+pub(crate) fn carriers_of_model_in(items: &[Value], name: &str) -> Vec<String> {
     let name = name.trim();
     if name.is_empty() { return Vec::new(); }
-    read_items().into_iter()
+    items.iter()
         .filter(|provider| bindings::resolve(provider, name).is_some())
         .filter_map(|provider| provider.get("id").and_then(Value::as_str).map(str::to_string))
         .collect()
+}
+
+pub fn carriers_of_model(name: &str) -> Vec<String> {
+    carriers_of_model_in(&read_items(), name)
 }
 
 /// 发给某个自定义家时应使用的**上游真名**与思考等级绑定。

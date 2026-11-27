@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use agent2api_provider_protocol as proto;
 use serde_json::Value;
 
@@ -8,28 +8,8 @@ use crate::server::core::account_store::plugin_accounts;
 use crate::server::core::providers::adapter::ProviderAdapter;
 
 const KEY: &str = "host.catalog.v1";
+const MAX_ACCOUNT_CATALOG_BYTES: usize = 256 * 1024;
 static GATE: Mutex<()> = Mutex::new(());
-
-struct Snapshot {
-    revision: u64,
-    at: Instant,
-    accounts: BTreeMap<String, proto::ModelList>,
-}
-fn snapshots() -> &'static Mutex<HashMap<String, Arc<Snapshot>>> {
-    static TABLE: OnceLock<Mutex<HashMap<String, Arc<Snapshot>>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-fn snapshot(provider: &str) -> Option<Arc<Snapshot>> {
-    let store = plugin_accounts::shared()?;
-    let revision = store.plugin_state_revision();
-    if let Some(cached) = snapshots().lock().ok()?.get(provider)
-        .filter(|cached| cached.revision == revision && cached.at.elapsed() < Duration::from_secs(1)).cloned() { return Some(cached); }
-    let accounts = store.plugin_states_for_provider(provider, KEY).into_iter()
-        .filter_map(|(id, state)| list(state["value"].clone()).ok().map(|list| (id, list))).collect();
-    let current = Arc::new(Snapshot { revision, at: Instant::now(), accounts });
-    snapshots().lock().ok()?.insert(provider.into(), current.clone());
-    Some(current)
-}
 
 pub(crate) fn enabled(provider: &str) -> bool { super::has_capability(provider, "catalog.accounts.v1") }
 
@@ -48,14 +28,40 @@ pub(super) fn cached(provider: &str, account: &str) -> Result<Value, proto::Wire
     Ok(state["value"].clone())
 }
 
+fn within_catalog_limit(value: &Value) -> bool {
+    struct Budget {
+        used: usize,
+        limit: usize,
+    }
+    impl Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.used = self
+                .used
+                .checked_add(bytes.len())
+                .filter(|used| *used <= self.limit)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "catalog limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Budget { used: 0, limit: MAX_ACCOUNT_CATALOG_BYTES }, value).is_ok()
+}
+
 fn list(value: Value) -> Result<proto::ModelList, proto::WireError> {
-    if value.to_string().len() > 256 * 1024 { return Err(super::error("账号目录超过大小限制")); }
+    if !within_catalog_limit(&value) { return Err(super::error("账号目录超过大小限制")); }
     let list: proto::ModelList = serde_json::from_value(value).map_err(|_| super::errors::protocol())?;
     if !list.meta.remote || list.meta.refreshed_at < 0 || list.models.len() > 4096
         || list.models.iter().any(|model| model["id"].as_str().is_none_or(|id| id.trim().is_empty() || id.len() > 512)) {
         return Err(super::errors::protocol());
     }
     Ok(list)
+}
+
+/// 校验并解析单条账号的 `host.catalog.v1` 值（供 `AccountStore::catalog_cache` 增量缓存复用）。
+pub(crate) fn parse_account_catalog(value: &Value) -> Option<proto::ModelList> {
+    list(value.clone()).ok()
 }
 
 pub(crate) fn save(provider: &str, account: &str, value: Value) -> Result<usize, proto::WireError> {
@@ -91,11 +97,12 @@ fn merge(target: &mut Value, source: &Value) {
     }
 }
 
-pub(crate) fn aggregate(provider: &str) -> Option<proto::ModelList> {
-    let snapshot = snapshot(provider)?;
+pub(crate) fn aggregate_account_catalogs(
+    accounts: &BTreeMap<String, Arc<proto::ModelList>>,
+) -> proto::ModelList {
     let mut models = BTreeMap::new();
     let mut at = 0;
-    for list in snapshot.accounts.values() {
+    for list in accounts.values() {
         at = at.max(list.meta.refreshed_at);
         for model in &list.models {
             if let Some(id) = model["id"].as_str() {
@@ -104,12 +111,22 @@ pub(crate) fn aggregate(provider: &str) -> Option<proto::ModelList> {
             }
         }
     }
-    Some(proto::ModelList { models: models.into_values().collect(),
-        meta: proto::CatalogMeta { remote: true, refreshed_at: at } })
+    proto::ModelList {
+        models: models.into_values().collect(),
+        meta: proto::CatalogMeta { remote: true, refreshed_at: at },
+    }
+}
+
+pub(crate) fn aggregate_arc(provider: &str) -> Option<Arc<proto::ModelList>> {
+    let store = plugin_accounts::shared()?;
+    Some(store.provider_catalog(provider)?.aggregated.clone())
+}
+
+pub(crate) fn aggregate(provider: &str) -> Option<proto::ModelList> {
+    aggregate_arc(provider).map(|list| (*list).clone())
 }
 
 pub(crate) fn rebuild(provider: &str) {
-    if let Ok(mut table) = snapshots().lock() { table.remove(provider); }
     if let Some(list) = aggregate(provider) { super::super::rpc_cache::set_remote(provider, list); }
 }
 
@@ -123,7 +140,8 @@ pub(crate) fn route_allowed(account: &Value, model: &str) -> Option<bool> {
 
 pub(crate) fn allowed(provider: &str, account: &str, model: &str) -> Option<bool> {
     if !enforces_permissions(provider) || model.is_empty() { return None; }
-    let snapshot = snapshot(provider)?;
+    let store = plugin_accounts::shared()?;
+    let snapshot = store.provider_catalog(provider)?;
     let list = snapshot.accounts.get(account)?;
     Some(list.models.iter().any(|entry| entry["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(model))))
 }

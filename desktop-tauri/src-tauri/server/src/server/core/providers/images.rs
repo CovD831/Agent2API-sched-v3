@@ -78,11 +78,7 @@ pub fn model_is_image(model: &Value) -> bool {
 }
 
 pub fn provider_model_is_image(provider: &str, requested: &str) -> bool {
-    let wire = super::catalog::wire_target_for_provider(requested, provider, None);
-    super::catalog::manifest_for_provider(provider)
-        .iter()
-        .find(|item| super::super::models::model_id(item).eq_ignore_ascii_case(&wire.model))
-        .is_some_and(model_is_image)
+    super::catalog::provider_model_is_image(provider, requested)
 }
 
 pub fn operation_providers(model: &str, operation: ImageOperation) -> Vec<String> {

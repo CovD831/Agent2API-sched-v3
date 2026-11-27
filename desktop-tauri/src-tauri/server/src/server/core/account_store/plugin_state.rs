@@ -4,8 +4,9 @@ use serde_json::{json, Value};
 use super::{sql, AccountStore};
 
 impl AccountStore {
+    #[allow(dead_code)]
     pub(crate) fn plugin_state_revision(&self) -> u64 {
-        self.database().map(|db| db.account_revision()).unwrap_or(0)
+        self.catalog_state_revision()
     }
     pub(crate) fn plugin_state(&self, provider: &str, id: &str, key: &str) -> Result<Value, String> {
         let record = self.read_record(id).ok_or("账号不存在")?;
@@ -41,6 +42,7 @@ impl AccountStore {
         }).map_err(|error| error.message)?
     }
 
+    #[allow(dead_code)]
     pub(crate) fn plugin_states_for_provider(&self, provider: &str, key: &str) -> Vec<(String, Value)> {
         self.read_provider(provider).iter().filter(|record| record.enabled() && record.has_credentials())
             .filter_map(|record| record.get("pluginState").and_then(|state| state.get(key))

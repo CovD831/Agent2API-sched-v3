@@ -32,7 +32,10 @@ mod task_guard;
 pub(crate) use task_guard::TaskStoreError;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
 use serde_json::{json, Value};
 
@@ -100,6 +103,8 @@ pub struct AccountStore {
 struct Inner {
     pub(super) cache: super::snapshot::SnapshotCache,
     pub(super) record_cache: std::sync::RwLock<super::read_state::RecordCache>,
+    pub(super) catalog_cache: super::catalog_cache::CatalogCache,
+    instance_id: u64,
     validation: Mutex<Option<crate::server::core::providers::catalog::ValidationCache>>,
     /// SQLite 句柄。`None` = 数据库打开失败（启动时已记日志）。
     ///
@@ -155,6 +160,8 @@ impl AccountStore {
                 lock: Mutex::new(()),
                 cache: Default::default(),
                 record_cache: Default::default(),
+                catalog_cache: Default::default(),
+                instance_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
                 validation: Mutex::new(None),
             }),
         }
@@ -190,6 +197,14 @@ impl AccountStore {
 
     pub(super) fn record_cache(&self) -> &std::sync::RwLock<super::read_state::RecordCache> {
         &self.inner.record_cache
+    }
+
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.inner.instance_id
+    }
+
+    pub(super) fn catalog_cache(&self) -> &super::catalog_cache::CatalogCache {
+        &self.inner.catalog_cache
     }
 
     /// 账号数据是否已落盘（Node 版账号存储导出的

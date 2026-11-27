@@ -4,6 +4,7 @@
 //! 不会禁用它指向的上游模型，也不会影响仍开启的别名。
 //! 清单来源在本文件，绑定解析在 routing.rs，对外与管理视图在 view.rs。
 
+mod index;
 mod routing;
 mod snapshot;
 mod view;
@@ -39,9 +40,17 @@ pub(crate) fn upstream_manifests() -> Vec<(String, Vec<Value>)> {
     }).collect()
 }
 
+pub(crate) fn manifest_for_provider(provider: &str) -> Vec<Value> {
+    (*index::current().manifest_for(provider)).clone()
+}
+
+pub(crate) fn provider_model_is_image(provider: &str, requested: &str) -> bool {
+    index::current().provider_model_is_image(provider, requested)
+}
+
 /// 原始能力清单不应用绑定开关；关闭原始 ID 后，别名仍需解析到这条上游记录。
 /// 用户自建模型、models.dev 补齐与能力覆盖都在这一处应用，插件与内置身份共用。
-pub(crate) fn manifest_for_provider(provider: &str) -> Vec<Value> {
+pub(super) fn build_manifest_for_provider(provider: &str) -> Vec<Value> {
     let Some(adapter) = adapter_by_id(provider) else {
         return Vec::new();
     };

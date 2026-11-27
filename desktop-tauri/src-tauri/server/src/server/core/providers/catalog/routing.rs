@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::server::core::{custom_providers, model_rules};
+use crate::server::core::model_rules;
 use crate::server::core::models::model_id;
 use crate::server::core::providers::adapter::adapter_by_id;
 
@@ -65,61 +65,12 @@ pub(super) fn builtin_target(
 /// 原始能力查询不应用开关，供管理 API 展开旧版全局规则。
 /// 别名也算登记过的名字，但必须能解析到该家的真实上游记录。
 pub fn providers_for_model(model: &str) -> Vec<String> {
-    let model = model.trim();
-    if model.is_empty() {
-        return Vec::new();
-    }
-    let rules = model_rules::shared();
-    let manifests: Vec<_> = all_provider_ids().into_iter()
-        .map(|provider| {
-            let manifest = manifest_for_provider(&provider);
-            (provider, manifest)
-        })
-        .collect();
-    let exact = manifests.iter().any(|(_, items)| {
-        items.iter().any(|item| model_id(item).eq_ignore_ascii_case(model))
-    });
-    let mut result: Vec<_> = manifests.into_iter().filter(|(provider, items)| {
-        let declared = if exact {
-            items.iter().any(|item| model_id(item).eq_ignore_ascii_case(model))
-        } else {
-            entry_id_in_manifest(items, model).is_some()
-        };
-        let mapped = rules.mappings.iter().any(|mapping| {
-            mapping.alias.eq_ignore_ascii_case(model)
-                && mapping.provider.as_deref().map_or(true, |owner| owner.eq_ignore_ascii_case(provider))
-                && entry_id_in_manifest(items, &mapping.target).is_some()
-        });
-        declared || mapped
-    }).map(|(provider, _)| provider).collect();
-    result.extend(custom_providers::list().into_iter().filter_map(|provider| {
-        let models = provider.get("models")?.as_array()?;
-        let declared = models.iter().any(|entry| model_id(entry).eq_ignore_ascii_case(model));
-        let mapped = provider
-            .get("mappings")
-            .and_then(Value::as_array)
-            .is_some_and(|mappings| {
-                mappings.iter().any(|mapping| {
-                    mapping
-                        .get("alias")
-                        .and_then(Value::as_str)
-                        .is_some_and(|alias| alias.eq_ignore_ascii_case(model))
-                })
-            });
-        (declared || mapped)
-            .then(|| provider.get("id").and_then(Value::as_str).unwrap_or("").to_string())
-    }));
-    result
+    super::index::current().providers_for_model(model)
 }
 
 /// 只返回有开启绑定的提供商，不把关闭的 ID 回落给默认提供商。
 pub fn forwarding_providers(model: &str) -> Vec<String> {
-    let rules = model_rules::shared();
-    let mut result: Vec<_> = all_provider_ids().into_iter().filter(|provider| {
-        builtin_target(&rules, provider, &manifest_for_provider(provider), model).is_some()
-    }).collect();
-    result.extend(custom_providers::carriers_of_model(model));
-    result
+    super::index::current().forwarding_providers(model)
 }
 
 /// 「这个名字是不是被关掉了」—— 只在广告里没有它时用来区分「承载家全被关闭」
@@ -144,14 +95,7 @@ pub fn model_blocked_everywhere(model: &str) -> bool {
 }
 
 pub fn wire_target_for_provider(model: &str, provider_id: &str, _account: Option<&Value>) -> WireTarget {
-    let requested = model.trim();
-    // 自定义提供商在自己的转发模块解析一次，避免把别名提前改写后丢失其等级绑定。
-    let resolved = if custom_providers::is_custom_provider_id(provider_id) {
-        None
-    } else {
-        builtin_target(&model_rules::shared(), provider_id, &manifest_for_provider(provider_id), requested)
-    };
-    resolved.unwrap_or_else(|| WireTarget { model: requested.to_string(), reasoning: None })
+    super::index::current().wire_target_for_provider(model, provider_id)
 }
 
 pub fn default_model_catalog() -> Vec<Value> {

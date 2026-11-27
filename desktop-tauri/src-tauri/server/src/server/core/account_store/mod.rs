@@ -125,6 +125,7 @@ pub(crate) mod policy_cooldowns;
 pub(crate) mod policy_cooldown_view;
 mod read_rows;
 mod read_state;
+mod catalog_cache;
 pub mod sql;
 mod snapshot;
 pub mod state;
