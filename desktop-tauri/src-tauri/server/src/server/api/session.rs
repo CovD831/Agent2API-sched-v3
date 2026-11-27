@@ -57,8 +57,9 @@ pub async fn get_session(State(state): State<ServerState>, Query(query): Query<s
             crate::server::core::routing::provider_of(account),
         )).map(|account| account.as_ref().clone()).collect()
     } else { crate::server::core::routing::accounts_of(&accounts) };
+    let last_request_model = config::last_request_model_live();
     let routed = super::routing_api::queue_for_accounts(
-        &state, snapshot.last_request_model().map(str::to_string), &route_accounts,
+        &state, last_request_model.clone(), &route_accounts,
     )
         .get("pickedId").and_then(Value::as_str).filter(|id| !id.is_empty())
         .map(|id| Value::String(id.to_string())).unwrap_or(Value::Null);
@@ -89,7 +90,7 @@ pub async fn get_session(State(state): State<ServerState>, Query(query): Query<s
         // 请求的模型派生的 `routedAccountId`（见下），两者在队首正被限流时会不同。
         "accounts": accounts,
         // 最近一次实际请求用的模型：账号页的「模型」筛选默认选它
-        "lastRequestModel": snapshot.last_request_model(),
+        "lastRequestModel": last_request_model,
         // 与路由页共用的无会话预演队首，包含自动消耗规则与运行期保护。
         "routedAccountId": routed,
         "defaultModel": snapshot.default_model(),

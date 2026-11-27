@@ -62,17 +62,17 @@ pub(crate) fn confirm(confirmation: Confirmation) -> Result<ConfirmationResult, 
         });
     }
     let value = confirmation.updated_grants(next.raw.get(KEY))?;
-    let before = super::synced_fingerprint(&next.raw);
+    let previous = next.clone();
     next.raw_mut().insert(KEY.to_string(), value);
-    // save_raw只有true能证明提交成功；false不生成保存回执，也不发布授权内存值。
-    if !super::save_raw(&next.raw) {
+    // save_single_key只有true能证明提交成功；false不生成保存回执，也不发布授权内存值。
+    if !super::save_single_key(KEY, next.raw.get(KEY)) {
         return Ok(ConfirmationResult {
             saved: None,
             authorized: false,
             message: "授权记录保存未获确认，执行批准保持关闭；请刷新状态",
         });
     }
-    let changed = before != super::synced_fingerprint(&next.raw);
+    let changed = super::synced_key_changed(KEY, &previous.raw, &next.raw);
     if !publish(next) {
         return Err("权限变更结果未确认，请刷新状态".into());
     }
@@ -171,10 +171,10 @@ pub(crate) fn revoke<T>(
     let empty = Value::Null;
     let current = next.raw.get(KEY).unwrap_or(&empty);
     let (value, result) = mutate(current)?;
-    let before = super::synced_fingerprint(&next.raw);
+    let previous = next.clone();
     next.raw_mut().insert(KEY.to_string(), value);
-    let saved = super::save_raw(&next.raw);
-    let changed = before != super::synced_fingerprint(&next.raw);
+    let saved = super::save_single_key(KEY, next.raw.get(KEY));
+    let changed = super::synced_key_changed(KEY, &previous.raw, &next.raw);
     if !publish(next) {
         return Err("权限变更结果未确认，请刷新状态".into());
     }

@@ -9,7 +9,7 @@ use crate::server::core::usage_records::UsageRecord;
 
 struct CachedBalance {
     members: Vec<Arc<Value>>,
-    records: Arc<HashMap<String, UsageRecord>>,
+    records: Arc<HashMap<String, Arc<UsageRecord>>>,
     filtered: bool,
     offset: i32,
     checked_at: Instant,
@@ -21,7 +21,7 @@ fn cache() -> &'static Mutex<HashMap<String, CachedBalance>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(super) fn summary(provider: &str, members: &[Arc<Value>], records: &Arc<HashMap<String, UsageRecord>>, filtered: bool, now: i64, offset: i32) -> Value {
+pub(super) fn summary(provider: &str, members: &[Arc<Value>], records: &Arc<HashMap<String, Arc<UsageRecord>>>, filtered: bool, now: i64, offset: i32) -> Value {
     if let Ok(cache) = cache().lock() {
         if let Some(cached) = cache.get(provider) {
             if cached.members.len() == members.len() && cached.members.iter().zip(members).all(|(left, right)| Arc::ptr_eq(left, right))

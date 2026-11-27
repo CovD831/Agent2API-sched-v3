@@ -1,7 +1,7 @@
 //! Bridge connecting `agent2api-server` (`UpstreamService` / `AccountStore` / `RequestTelemetry`)
 //! to the standalone `llm-pool-scheduler` crate, plus single-flight per-account token refresh locks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -161,7 +161,7 @@ impl GatewayScheduler {
     fn rebuild_descriptors(&self, store: &AccountStore, rev: u64, gen: u64, now_ms: i64) {
         let snapshot = store.routing_snapshot();
         let balance_facts = limiter::sources::facts();
-        let usage_records_map = crate::server::core::usage_records::load_all();
+        let usage_records_map = crate::server::core::usage_records::cached_snapshot();
 
         // Derive provider priority tiers in O(N) without cloning JSON Values, matching `account_order::manual_groups`:
         // each provider's queue position is determined by the minimum `(priority, addedAt)` among its accounts.
@@ -202,7 +202,9 @@ impl GatewayScheduler {
                 continue;
             }
             let enabled = acc.get("enabled").and_then(Value::as_bool) != Some(false);
-            let usage_dead = usage_records_map.get(id).is_some_and(usage_record_is_dead);
+            let usage_dead = usage_records_map
+                .get(id)
+                .is_some_and(|record| usage_record_is_dead(record));
             let raw_needs_relogin = acc.get("needsRelogin").and_then(Value::as_bool) == Some(true);
             let is_wrong_apig = raw_needs_relogin
                 && acc
@@ -345,7 +347,7 @@ pub(super) fn try_select_fast(
     let snapshot = service.store.routing_snapshot();
 
     // Filter providers by profile scope + local readiness gate (unless all providers are gated)
-    let profile = request_routing.profile.as_ref();
+    let profile = request_routing.profile.as_deref();
     let scoped_providers: Vec<&str> = providers
         .iter()
         .copied()
@@ -369,9 +371,7 @@ pub(super) fn try_select_fast(
         ungated
     };
 
-    let route_excluded: Option<HashSet<String>> = profile
-        .filter(|prof| !prof.excluded_accounts.is_empty())
-        .map(|prof| prof.excluded_accounts.iter().cloned().collect());
+    let route_excluded = request_routing.excluded_set.as_deref();
 
     let settings = request_routing.settings;
     let sticky_ttl_ms = routing::sticky_ttl_ms(settings.sticky);
@@ -386,7 +386,7 @@ pub(super) fn try_select_fast(
             sticky_key: conv_key,
             sticky_ttl_ms,
             excluded_node_ids: &local_excluded,
-            route_excluded_ids: route_excluded.as_ref(),
+            route_excluded_ids: route_excluded,
             route_allowed_ids: None,
             pinned_node_id: None,
             attempt_index: (tried_ids.len().min(u8::MAX as usize)) as u8,

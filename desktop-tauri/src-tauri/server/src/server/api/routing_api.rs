@@ -264,7 +264,7 @@ pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, acc
         "sticky": settings.sticky.as_str(),
         "model": model.clone().map(Value::String).unwrap_or(Value::Null),
         "modelKnown": model.as_ref().map(|_| !providers.is_empty()),
-        "lastRequestModel": snapshot.last_request_model(),
+        "lastRequestModel": config::last_request_model_live(),
         "pickedId": plan.ordered.first().map(|entry| entry.id.clone()).unwrap_or_default(),
         "ordered": plan.ordered.iter().map(entry_json).collect::<Vec<_>>(),
         "blocked": plan.blocked.iter().map(entry_json).collect::<Vec<_>>(),

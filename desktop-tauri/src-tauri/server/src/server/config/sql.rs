@@ -258,3 +258,75 @@ pub(super) fn write_all(db: &Db, raw: &Map<String, Value>) -> Result<(), String>
         Some(result) => result,
     }
 }
+
+/// 增量写配置：在一个事务里仅 UPSERT 值发生变化的键、DELETE 已移除的非保留键。
+/// 保留键碰撞检测与回滚语义与 [`write_conn`] 完全一致。
+pub(crate) fn write_diff_conn(
+    conn: &Connection,
+    previous: &Map<String, Value>,
+    next: &Map<String, Value>,
+) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("开启配置增量写入事务失败: {error}"))?;
+    let mut touched = false;
+    for (key, value) in next {
+        if previous.get(key) != Some(value) {
+            upsert(&tx, key, value)?;
+            touched = true;
+        }
+    }
+    for key in previous.keys() {
+        if !next.contains_key(key) && !schema::is_reserved(key) {
+            tx.execute("DELETE FROM kv WHERE key = ?1", rusqlite::params![key])
+                .map_err(|error| format!("删除配置项 {key} 失败: {error}"))?;
+            touched = true;
+        }
+    }
+    if touched {
+        tx.commit()
+            .map_err(|error| format!("提交配置增量写入失败: {error}"))?;
+    }
+    Ok(())
+}
+
+pub(super) fn write_diff(
+    db: &Db,
+    previous: &Map<String, Value>,
+    next: &Map<String, Value>,
+) -> Result<(), String> {
+    match db.with(|conn| write_diff_conn(conn, previous, next)) {
+        None => Err("数据库不可用".to_string()),
+        Some(result) => result,
+    }
+}
+
+/// 单键写入或删除（`None` = 删除）；拒绝碰撞保留键。
+pub(crate) fn write_single_key_conn(
+    conn: &Connection,
+    key: &str,
+    value: Option<&Value>,
+) -> Result<(), String> {
+    if schema::is_reserved(key) {
+        return Err(format!("配置键与保留键同名，拒绝写入: {key}"));
+    }
+    match value {
+        Some(value) => upsert(conn, key, value),
+        None => {
+            conn.execute("DELETE FROM kv WHERE key = ?1", rusqlite::params![key])
+                .map_err(|error| format!("删除配置项 {key} 失败: {error}"))?;
+            Ok(())
+        }
+    }
+}
+
+pub(super) fn write_single_key(
+    db: &Db,
+    key: &str,
+    value: Option<&Value>,
+) -> Result<(), String> {
+    match db.with(|conn| write_single_key_conn(conn, key, value)) {
+        None => Err("数据库不可用".to_string()),
+        Some(result) => result,
+    }
+}

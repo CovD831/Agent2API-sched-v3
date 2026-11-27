@@ -1,6 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering as AtomicOrdering}};
+
+static USAGE_REVISION: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn revision() -> u64 {
+    USAGE_REVISION.load(AtomicOrdering::Acquire)
+}
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -47,6 +53,7 @@ fn usage_facts(usage: &Value, query_config: &str) -> Arc<UsageFacts> {
 
 pub fn note_usage(id: &str, usage: &Value, query_config: &str) {
     if let Ok(mut facts) = usage_slot().lock() { facts.insert(id.to_string(), usage_facts(usage, query_config)); }
+    USAGE_REVISION.fetch_add(1, AtomicOrdering::AcqRel);
 }
 
 pub fn reload_usage(records: &HashMap<String, UsageRecord>) {
@@ -54,6 +61,7 @@ pub fn reload_usage(records: &HashMap<String, UsageRecord>) {
         record.usage.as_ref().map(|usage| (id.clone(), usage_facts(usage, &record.query_config)))
     }).collect();
     if let Ok(mut facts) = usage_slot().lock() { *facts = fresh; }
+    USAGE_REVISION.fetch_add(1, AtomicOrdering::AcqRel);
 }
 
 pub fn supports_credit_expiry(provider: &str) -> bool {

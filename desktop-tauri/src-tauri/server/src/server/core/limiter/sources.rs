@@ -50,12 +50,17 @@ pub fn current_for(account: &Value, facts: &SourceFacts) -> bool {
 }
 
 pub fn reload() {
-    let fresh = crate::server::core::usage_records::load_all().into_iter()
-        .filter_map(|(id, row)| row.usage.as_ref().map(|usage| {
-            let mut facts = parse(usage);
-            facts.query_config = row.query_config.clone();
-            (id, facts)
-        })).collect();
+    let snapshot = crate::server::core::usage_records::cached_snapshot();
+    let fresh = snapshot
+        .iter()
+        .filter_map(|(id, row)| {
+            row.usage.as_ref().map(|usage| {
+                let mut facts = parse(usage);
+                facts.query_config = row.query_config.clone();
+                (id.clone(), facts)
+            })
+        })
+        .collect();
     if let Ok(mut facts) = slot().lock() { *facts = fresh; }
 }
 

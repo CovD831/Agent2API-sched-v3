@@ -992,6 +992,50 @@ pub fn read_prompt_file(path: &str) -> Result<String, String> {
 
 /// 进程内全局配置快照：所有模块共用，避免每个请求都读盘
 static CONFIG: RwLock<Option<RuntimeConfig>> = RwLock::new(None);
+/// 最近一次请求模型的内存实时值（避免在转发热路径上抢 CONFIG_UPDATE_LOCK 或全量落盘）。
+static LAST_REQUEST_MODEL: RwLock<Option<String>> = RwLock::new(None);
+static LAST_MODEL_PERSISTED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static LAST_MODEL_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const LAST_MODEL_PERSIST_INTERVAL_MS: i64 = 30_000;
+
+static ROUTING_PROFILES_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+static ACCOUNT_SORT_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn routing_profiles_generation() -> u64 {
+    ROUTING_PROFILES_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn account_sort_generation() -> u64 {
+    ACCOUNT_SORT_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(super) fn bump_routing_profiles_generation() {
+    ROUTING_PROFILES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+pub(super) fn bump_account_sort_generation() {
+    ACCOUNT_SORT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+fn sync_last_request_model_cache(model: Option<String>) {
+    if let Ok(mut guard) = LAST_REQUEST_MODEL.write() {
+        *guard = model;
+    }
+    LAST_MODEL_PERSISTED_MS.store(0, std::sync::atomic::Ordering::Release);
+    LAST_MODEL_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// 读取最近一次实际转发的模型（优先内存实时值，回落快照字段）。
+pub fn last_request_model_live() -> Option<String> {
+    if let Ok(guard) = LAST_REQUEST_MODEL.read() {
+        if guard.is_some() {
+            return guard.clone();
+        }
+    }
+    current().last_request_model
+}
 
 /// 初始化全局配置（启动时调用一次；重复调用会重新读库，幂等）。
 ///
@@ -1019,6 +1063,9 @@ pub fn init(db: Option<Db>) -> RuntimeConfig {
     });
     let _ = DB.set(db);
     let snapshot = build(read_raw());
+    sync_last_request_model_cache(snapshot.last_request_model.clone());
+    bump_routing_profiles_generation();
+    bump_account_sort_generation();
     crate::server::core::providers::catalog::invalidate();
     if plugin_task_grants::publish(snapshot.clone()) {
         model_key_source::published(&snapshot, true);
@@ -1045,6 +1092,9 @@ pub fn reload() -> RuntimeConfig {
     model_key_source::before_reload();
     plugin_task_grants::before_reload();
     let snapshot = build(read_raw());
+    sync_last_request_model_cache(snapshot.last_request_model.clone());
+    bump_routing_profiles_generation();
+    bump_account_sort_generation();
     crate::server::core::providers::catalog::invalidate();
     if plugin_task_grants::publish(snapshot.clone()) {
         model_key_source::published(&snapshot, true);
@@ -1345,6 +1395,38 @@ fn update<F>(mutate: F) -> bool
 where
     F: FnOnce(&mut RuntimeConfig),
 {
+    update_with(
+        mutate,
+        |previous, next| save_raw_diff(&previous.raw, &next.raw),
+        |previous, next| synced_changed(&previous.raw, &next.raw),
+    )
+}
+
+fn update_single_key<F>(key: String, mutate: F) -> bool
+where
+    F: FnOnce(&mut RuntimeConfig),
+{
+    let persist_key = key.clone();
+    let sync_key = key;
+    update_with(
+        mutate,
+        move |previous, next| {
+            if previous.raw.get(&persist_key) == next.raw.get(&persist_key) {
+                storage_ready_for_write()
+            } else {
+                save_single_key(&persist_key, next.raw.get(&persist_key))
+            }
+        },
+        move |previous, next| synced_key_changed(&sync_key, &previous.raw, &next.raw),
+    )
+}
+
+fn update_with<F, S, C>(mutate: F, persist: S, sync_changed: C) -> bool
+where
+    F: FnOnce(&mut RuntimeConfig),
+    S: FnOnce(&RuntimeConfig, &RuntimeConfig) -> bool,
+    C: FnOnce(&RuntimeConfig, &RuntimeConfig) -> bool,
+{
     let _usage_guard = crate::server::core::usage_query::config::lock();
     // 读改写必须串行，否则两个模型的独立配置会互相覆盖。
     let _update_guard = plugin_task_grants::update_lock();
@@ -1354,7 +1436,6 @@ where
         return false;
     };
     let previous = next.clone();
-    let before = synced_fingerprint(&next.raw);
     mutate(&mut next);
     // CONFIG 克隆门已释放；本门撤销完成后才允许存储或新的配置发布。
     model_key_source::before_change(&previous, &next);
@@ -1363,11 +1444,19 @@ where
         != next.raw().get(crate::server::core::model_rules::KEY_MODEL_RULES) {
         next.model_rules = std::sync::Arc::new(crate::server::core::model_rules::ModelRules::from_raw(&next.raw));
     }
-    let saved = save_raw(&next.raw);
-    // 先算改动后的指纹再交出所有权：`next` 要移进内存快照
-    let changed = before != synced_fingerprint(&next.raw);
+    let routing_changed = previous.raw().get(routing_profiles::KEY_ROUTING_PROFILES)
+        != next.raw().get(routing_profiles::KEY_ROUTING_PROFILES)
+        || previous.raw().get(error_policy::KEY_ERROR_POLICY)
+            != next.raw().get(error_policy::KEY_ERROR_POLICY);
+    let sort_changed = previous.raw().get(account_sort::KEY_ACCOUNT_SORT)
+        != next.raw().get(account_sort::KEY_ACCOUNT_SORT);
+    let saved = persist(&previous, &next);
+    // 先算改动判断再交出所有权：`next` 要移进内存快照
+    let changed = sync_changed(&previous, &next);
     let catalog_changed = crate::server::core::providers::catalog::config_changed(&previous, &next);
     if catalog_changed { crate::server::core::providers::catalog::invalidate(); }
+    if routing_changed { bump_routing_profiles_generation(); }
+    if sort_changed { bump_account_sort_generation(); }
     // 只有 CONFIG 确认发布后才能启用新 Key 代；失败永久关闭，不复活旧对象。
     let key_snapshot = next.clone();
     if plugin_task_grants::publish(next) {
@@ -1377,41 +1466,92 @@ where
     }
     if catalog_changed { crate::server::core::providers::catalog::invalidate(); }
     // 云同步的自动上传：只有**同步范围内的键**真的变了才发信号。
-    //
-    // ── 为什么在这里而不是在 `save_raw` 里 ─────────────────────
-    // `save_raw` 也被迁移等路径调用，而那些路径不该触发上传（迁移跑在启动期，
-    // 远端还没配）。`update` 是「运行期改配置」的唯一入口（所有 setter 都经它），
-    // 语义正好。
-    //
-    // ── 为什么要在改之前先算一份指纹 ───────────────────────────
-    // `set_debug_mode` 这类 setter 会在「值没变」时也调 `update`（界面拨回原值）。
-    // 不比对的话每次拨动都会上传一次；比对之后只有真变了才发信号。
     if changed {
         crate::server::core::cloud_sync::auto_sync::notify_change();
     }
     saved
 }
 
-/// 同步范围内 kv 键的指纹：键名 + 值的稳定序列化。
-///
-/// 只用于「这次 `update` 有没有改动云同步关心的内容」，因此不必是密码学哈希
-/// —— 但用 sha256 可以避免把整份配置（含提示词全文）留在内存里做比较。
-fn synced_fingerprint(raw: &Map<String, Value>) -> String {
+pub(super) fn synced_changed(previous: &Map<String, Value>, next: &Map<String, Value>) -> bool {
     use crate::server::core::cloud_sync::snapshot::is_synced_kv_key;
-    use sha2::{Digest as _, Sha256};
 
-    let mut hasher = Sha256::new();
-    // `raw` 是 `serde_json::Map`（默认 BTreeMap），迭代顺序稳定
-    for (key, value) in raw {
-        if !is_synced_kv_key(key) {
-            continue;
+    for (key, value) in next {
+        if is_synced_kv_key(key) && previous.get(key) != Some(value) {
+            return true;
         }
-        hasher.update(key.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(value.to_string().as_bytes());
-        hasher.update(b"\n");
     }
-    format!("{:x}", hasher.finalize())
+    for key in previous.keys() {
+        if is_synced_kv_key(key) && !next.contains_key(key) {
+            return true;
+        }
+    }
+    false
+}
+
+pub(super) fn synced_key_changed(
+    key: &str,
+    previous: &Map<String, Value>,
+    next: &Map<String, Value>,
+) -> bool {
+    crate::server::core::cloud_sync::snapshot::is_synced_kv_key(key)
+        && previous.get(key) != next.get(key)
+}
+
+fn storage_ready_for_write() -> bool {
+    if crate::server::standby::enabled() {
+        return false;
+    }
+    if db().is_none() {
+        crate::server::logging::log(
+            "[Config]",
+            "❌ 保存失败: 数据库不可用（本次改动仅内存生效）",
+        );
+        return false;
+    }
+    true
+}
+
+pub(super) fn save_raw_diff(previous: &Map<String, Value>, next: &Map<String, Value>) -> bool {
+    if crate::server::standby::enabled() {
+        return false;
+    }
+    let Some(db) = db() else {
+        crate::server::logging::log(
+            "[Config]",
+            "❌ 保存失败: 数据库不可用（本次改动仅内存生效）",
+        );
+        return false;
+    };
+    if previous == next {
+        return true;
+    }
+    match sql::write_diff(&db, previous, next) {
+        Ok(()) => true,
+        Err(error) => {
+            crate::server::logging::log("[Config]", &format!("❌ 保存失败: {error}"));
+            false
+        }
+    }
+}
+
+pub(super) fn save_single_key(key: &str, value: Option<&Value>) -> bool {
+    if crate::server::standby::enabled() {
+        return false;
+    }
+    let Some(db) = db() else {
+        crate::server::logging::log(
+            "[Config]",
+            "❌ 保存失败: 数据库不可用（本次改动仅内存生效）",
+        );
+        return false;
+    };
+    match sql::write_single_key(&db, key, value) {
+        Ok(()) => true,
+        Err(error) => {
+            crate::server::logging::log("[Config]", &format!("❌ 保存失败: {error}"));
+            false
+        }
+    }
 }
 
 /// 把整份配置写进统一库（对应 Node 版 `saveConfig`）。
@@ -1535,19 +1675,60 @@ pub fn set_locale(locale: &str) -> bool {
     })
 }
 
-/// 记住本次请求用的模型（对应 Node 版 rememberRequestModel：仅在变化时写盘）
+/// 记住本次请求用的模型（内存立即生效；30s 节流异步单键落库，不抢配置锁、不阻断转发热路径）
 pub fn remember_request_model(model: &str) {
     let trimmed = model.trim();
-    if trimmed.is_empty() || current().last_request_model.as_deref() == Some(trimmed) {
+    if trimmed.is_empty() {
         return;
     }
-    let value = trimmed.to_string();
-    update(|config| {
-        config
-            .raw_mut()
-            .insert("lastRequestModel".to_string(), Value::String(value.clone()));
-        config.last_request_model = Some(value.clone());
-    });
+    let unchanged = LAST_REQUEST_MODEL
+        .read()
+        .ok()
+        .is_some_and(|guard| guard.as_deref() == Some(trimmed));
+    if !unchanged {
+        if let Ok(mut guard) = LAST_REQUEST_MODEL.write() {
+            *guard = Some(trimmed.to_string());
+        }
+        LAST_MODEL_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    }
+    if !LAST_MODEL_DIRTY.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if crate::server::standby::enabled() {
+        return;
+    }
+    let Some(db) = db() else {
+        return;
+    };
+    let now = crate::server::logging::now_ms();
+    let prev = LAST_MODEL_PERSISTED_MS.load(std::sync::atomic::Ordering::Acquire);
+    if prev != 0 && now.saturating_sub(prev) < LAST_MODEL_PERSIST_INTERVAL_MS {
+        return;
+    }
+    if LAST_MODEL_PERSISTED_MS
+        .compare_exchange(
+            prev,
+            now,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    LAST_MODEL_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+    let latest = LAST_REQUEST_MODEL
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| trimmed.to_string());
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || {
+            let _ = sql::write_single_key(&db, "lastRequestModel", Some(&Value::String(latest)));
+        });
+    } else {
+        let _ = sql::write_single_key(&db, "lastRequestModel", Some(&Value::String(latest)));
+    }
 }
 
 /// 写入 config.json 里任意字段（其他字段原样保留）。低频路径专用。
@@ -1564,31 +1745,32 @@ pub(crate) fn update_raw_fields(mutate: impl FnOnce(&mut Map<String, Value>)) ->
 
 pub(crate) fn update_raw_field_with(key: &str, mutate: impl FnOnce(&mut Value)) -> bool {
     let key = key.to_string();
-    update(move |config| {
-        mutate(config.raw_mut().entry(key.clone()).or_insert(Value::Null));
+    let mutate_key = key.clone();
+    update_single_key(key, move |config| {
+        mutate(config.raw_mut().entry(mutate_key.clone()).or_insert(Value::Null));
         // apiKey 属于「生效字段」，写它时要同步内存里的值。这里存的是**磁盘原值**
         // （本函数也会被用来往这个键里写 `enc1:` 信封，见 `core::legacy_api_key`
         // 的原地加密迁移），给界面看的解密在 `RuntimeConfig::masked_api_key` 里
         // —— 为什么不在这一层解密，那里有说明。
-        if key == crate::server::core::api_keys::KEY_API_KEY {
+        if mutate_key == crate::server::core::api_keys::KEY_API_KEY {
             config.api_key = string_field(&config.raw, crate::server::core::api_keys::KEY_API_KEY);
         }
-        if key == routing_profiles::KEY_ROUTING_PROFILES {
+        if mutate_key == routing_profiles::KEY_ROUTING_PROFILES {
             config.routing_profiles = routing_profiles::from_raw(&config.raw);
         }
-        if key == compact_routes::KEY_COMPACT_ROUTES {
+        if mutate_key == compact_routes::KEY_COMPACT_ROUTES {
             config.compact_routes = compact_routes::from_raw(&config.raw);
         }
-        if key == title_routes::KEY_TITLE_ROUTES {
+        if mutate_key == title_routes::KEY_TITLE_ROUTES {
             config.title_routes = title_routes::from_raw(&config.raw);
         }
-        if key == client_identification::KEY_CLIENT_IDENTIFICATION {
+        if mutate_key == client_identification::KEY_CLIENT_IDENTIFICATION {
             config.client_identification = client_identification::from_raw(&config.raw);
         }
-        if key == vision_compat::KEY_VISION_COMPAT {
+        if mutate_key == vision_compat::KEY_VISION_COMPAT {
             config.vision_compat = vision_compat::from_raw(&config.raw);
         }
-        if key == account_sort::KEY_ACCOUNT_SORT {
+        if mutate_key == account_sort::KEY_ACCOUNT_SORT {
             config.account_sort = account_sort::from_raw(&config.raw);
         }
     })
@@ -1939,7 +2121,7 @@ pub fn routing_settings() -> RoutingSettings {
 /// 处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃。与 `set_timeouts`
 /// 同一模式：内存快照与 raw 底稿一起改。
 pub fn set_routing(patch: RoutingPatch) -> bool {
-    update(|config| {
+    let saved = update(|config| {
         let mut next = config.routing;
         if let Some(strategy) = patch.strategy {
             config
@@ -1987,7 +2169,9 @@ pub fn set_routing(patch: RoutingPatch) -> bool {
         config.routing = next;
         error_policy::sync_legacy(config.raw_mut(), false);
         config.error_policy = error_policy::from_raw(&config.raw);
-    })
+    });
+    bump_routing_profiles_generation();
+    saved
 }
 
 // ─── 调试模式（debugMode）────────────────────────────────────
@@ -2834,6 +3018,49 @@ mod auto_continue_tests {
                 assert!(!std::sync::Arc::ptr_eq(&snap_a.raw, &snap_c.raw));
                 assert_eq!(account_defaults_max_concurrent_of("deepseek"), None);
                 assert_eq!(stream_max_lifetime_ms(), 900_000);
+            },
+        );
+    }
+
+    #[test]
+    fn remember_request_model_updates_live_and_synced_changed_filters_keys() {
+        crate::test_support::isolated(
+            concat!(
+                module_path!(),
+                "::remember_request_model_updates_live_and_synced_changed_filters_keys"
+            ),
+            || {
+                let _guard = hold_config();
+                let dir = tempfile::tempdir().unwrap();
+                let db = crate::server::db::Db::open(&dir.path().join("agent2api.db")).unwrap();
+                sql::write_single_key(&db, "otherSetting", Some(&json!("keep-me"))).unwrap();
+                init(Some(db.clone()));
+                assert_eq!(last_request_model_live(), None);
+
+                remember_request_model("gpt-4o-mini");
+                assert_eq!(last_request_model_live().as_deref(), Some("gpt-4o-mini"));
+                let (persisted, _) = sql::read_snapshot(&db).unwrap();
+                assert_eq!(persisted.get("lastRequestModel"), Some(&json!("gpt-4o-mini")));
+                assert_eq!(persisted.get("otherSetting"), Some(&json!("keep-me")));
+
+                // 30s 节流窗内的第二次更新立即反映到实时读路径且不阻塞
+                remember_request_model("claude-3-7-sonnet");
+                assert_eq!(last_request_model_live().as_deref(), Some("claude-3-7-sonnet"));
+
+                let before = raw_of(&[("logDir", json!("/tmp/a")), ("locale", json!("zh-CN"))]);
+                let excluded_only = raw_of(&[("logDir", json!("/tmp/b")), ("locale", json!("zh-CN"))]);
+                let reserved_only = raw_of(&[
+                    ("logDir", json!("/tmp/a")),
+                    ("locale", json!("zh-CN")),
+                    ("configMigrated", json!(true)),
+                ]);
+                let synced = raw_of(&[("logDir", json!("/tmp/a")), ("locale", json!("en-US"))]);
+                assert!(!synced_changed(&before, &excluded_only));
+                assert!(!synced_changed(&before, &reserved_only));
+                assert!(synced_changed(&before, &synced));
+                assert!(!synced_key_changed("logDir", &before, &excluded_only));
+                assert!(!synced_key_changed("configMigrated", &before, &reserved_only));
+                assert!(synced_key_changed("locale", &before, &synced));
             },
         );
     }

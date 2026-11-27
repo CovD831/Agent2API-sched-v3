@@ -93,6 +93,7 @@ pub fn save_workspace(
     }).map_err(|error| error.to_string())?;
     next.routing_profiles = Arc::new(profiles);
     crate::server::core::providers::catalog::invalidate();
+    super::bump_routing_profiles_generation();
     *CONFIG.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next);
     crate::server::core::providers::catalog::invalidate();
     drop(guard);

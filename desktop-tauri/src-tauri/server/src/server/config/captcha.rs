@@ -168,7 +168,7 @@ pub(crate) fn save(object: &Map<String, Value>) -> Result<(), (i32, String)> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut next = super::current();
-    let before = super::synced_fingerprint(&next.raw);
+    let previous = next.clone();
     let mut settings = CaptchaSettings::from_config(&next);
     for (name, target) in [
         ("captchaProvider", &mut settings.provider),
@@ -235,10 +235,10 @@ pub(crate) fn save(object: &Map<String, Value>) -> Result<(), (i32, String)> {
         );
     }
     // 登录门槛只有在持久化成功后切换，避免保存失败却已把用户锁在新配置外。
-    if !super::save_raw(&next.raw) {
+    if !super::save_raw_diff(&previous.raw, &next.raw) {
         return Err((500, "写入配置失败，请重试".into()));
     }
-    let changed = before != super::synced_fingerprint(&next.raw);
+    let changed = super::synced_changed(&previous.raw, &next.raw);
     *CONFIG
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next);

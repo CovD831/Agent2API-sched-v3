@@ -70,8 +70,7 @@ impl AutoCheckin {
             {
                 break;
             }
-            let current = self
-                .planned_schedules()
+            let current = checkin_schedules::list()
                 .into_iter()
                 .find(|schedule| schedule.id == id)?;
             if !current.enabled {
@@ -93,7 +92,16 @@ impl AutoCheckin {
                     times::effective_time(&current, &provider), times::effective_end(&current, &provider))
             };
             let selected = vec![account.clone()];
-            super::write_state(json!({ "lastFiredDate": date }));
+            let already_fired_today = crate::server::config::with_raw(|raw| {
+                raw.get(super::CONFIG_KEY)
+                    .and_then(|value| value.get("lastFiredDate"))
+                    .and_then(Value::as_str)
+                    == Some(date.as_str())
+            })
+            .unwrap_or(false);
+            if !already_fired_today {
+                super::write_state(json!({ "lastFiredDate": date }));
+            }
             match checkin::run_checkin_selected(
                 &self.store,
                 &self.billing,
@@ -118,8 +126,7 @@ impl AutoCheckin {
                         Some(&selected),
                         retry::RetryConfig::of(Some(&current), retry::Round::Other),
                     );
-                    checkin_schedules::mark_result(id, Some(result.clone()));
-                    super::write_state(json!({ "lastResult": result }));
+                    checkin_schedules::mark_result_and_summary(id, Some(result.clone()));
                     summary = Some(result);
                 }
                 Err(error) => {

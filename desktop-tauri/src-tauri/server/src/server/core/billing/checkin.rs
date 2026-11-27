@@ -191,14 +191,14 @@ fn is_available(account: &Value) -> bool {
         .unwrap_or(true)
 }
 
-/// 账号列表快照（`store.listAccounts().accounts`）
+/// 账号列表快照（仅公开视图数组，不做前端排序摘要）
 fn accounts_of(store: &AccountStore) -> Vec<Value> {
     store
-        .list_accounts()
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+        .routing_snapshot_fresh()
+        .public_accounts
+        .iter()
+        .map(|account| (**account).clone())
+        .collect()
 }
 
 /// 签到目标集合。
@@ -224,15 +224,11 @@ pub fn resolve_checkin_targets(
     providers: &[String],
     id: Option<&str>,
 ) -> Result<(Vec<Value>, usize), CheckinError> {
-    let all = accounts_of(store);
     if let Some(id) = id.filter(|value| !value.is_empty()) {
-        let found: Vec<Value> = all
-            .into_iter()
-            .filter(|account| account.get("id").and_then(Value::as_str) == Some(id))
-            .collect();
-        if found.is_empty() {
+        let snapshot = store.routing_snapshot_fresh();
+        let Some(found) = snapshot.public_by_id.get(id) else {
             return Err(CheckinError::new("账号不存在", 404));
-        }
+        };
         // 唯一的拒绝理由：上游这一站根本没有签到/活跃任务（Qoder 等的国际版）。
         // 文案与签到中心「范围外」分组那句同义 —— 两处说法不一致会让用户以为
         // 遇到的是两个不同的问题。WorkBuddy 国际版已由活跃任务分支放行。
@@ -240,8 +236,8 @@ pub fn resolve_checkin_targets(
         // 访客单独给一句：它「不支持签到」的原因与别家不同（不是这一站没接链
         // 路，而是访客本来就没有积分体系），用户看到「该账号暂不支持签到」
         // 会去翻设置找原因。文案与签到中心的范围外原因同义。
-        if !supports_checkin(&found[0]) {
-            if found[0].get("isGuest").and_then(Value::as_bool) == Some(true) {
+        if !supports_checkin(found) {
+            if found.get("isGuest").and_then(Value::as_bool) == Some(true) {
                 return Err(CheckinError::new(
                     "访客账号没有积分体系，仅登录账号可签到",
                     400,
@@ -249,8 +245,9 @@ pub fn resolve_checkin_targets(
             }
             return Err(CheckinError::new("该账号暂不支持签到或每日活跃任务", 400));
         }
-        return Ok((found, 0));
+        return Ok((vec![(**found).clone()], 0));
     }
+    let all = accounts_of(store);
     let available: Vec<Value> = all.into_iter().filter(is_available).collect();
     let total = available.len();
     let eligible: Vec<Value> = available
@@ -624,12 +621,30 @@ pub(crate) async fn run_checkin_selected(
     source: &str,
     selected: Option<&[String]>,
 ) -> Result<Value, CheckinError> {
-    let (mut targets, mut skipped) = resolve_checkin_targets(store, providers, id)?;
-    if let Some(selected) = selected {
-        targets.retain(|account| account.get("id").and_then(Value::as_str)
-            .is_some_and(|id| selected.iter().any(|selected| selected == id)));
-        skipped = selected.len().saturating_sub(targets.len());
-    }
+    let (targets, skipped) = if id.is_none() && selected.is_some_and(|items| items.len() == 1) {
+        let target_id = &selected.unwrap()[0];
+        let snapshot = store.routing_snapshot_fresh();
+        let targets: Vec<Value> = snapshot
+            .public_by_id
+            .get(target_id)
+            .filter(|account| {
+                is_available(account)
+                    && supports_checkin(account)
+                    && matches_provider_filter(account, providers)
+            })
+            .map(|account| vec![(**account).clone()])
+            .unwrap_or_default();
+        let skipped = 1usize.saturating_sub(targets.len());
+        (targets, skipped)
+    } else {
+        let (mut targets, mut skipped) = resolve_checkin_targets(store, providers, id)?;
+        if let Some(selected) = selected {
+            targets.retain(|account| account.get("id").and_then(Value::as_str)
+                .is_some_and(|id| selected.iter().any(|selected| selected == id)));
+            skipped = selected.len().saturating_sub(targets.len());
+        }
+        (targets, skipped)
+    };
     // 「这次是用户在面板上点的吗」——只有 CodeArts 用得上（它的福利是写请求，
     // 有两道本地限流闸）。单账号 single 与批量 manual 都是点击触发；
     // schedule / startup 是无人值守，必须受闸。见 `checkin_for` 的说明。

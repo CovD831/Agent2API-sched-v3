@@ -79,3 +79,56 @@ fn migration_data_and_completion_marker_commit_together() {
             .clone()
     );
 }
+
+#[test]
+fn write_diff_only_touches_changed_and_deleted_keys() {
+    let conn = database();
+    let initial = json!({"unchanged": 1, "changed": "before", "removed": true})
+        .as_object()
+        .unwrap()
+        .clone();
+    write_conn(&conn, &initial).unwrap();
+    conn.execute(
+        "INSERT INTO kv(key, value) VALUES (?1, 'true')",
+        rusqlite::params![KEY_CONFIG_MIGRATED],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_unchanged_upd BEFORE UPDATE ON kv WHEN NEW.key='unchanged' BEGIN SELECT RAISE(ABORT,'touched unchanged'); END;
+         CREATE TRIGGER reject_unchanged_ins BEFORE INSERT ON kv WHEN NEW.key='unchanged' BEGIN SELECT RAISE(ABORT,'inserted unchanged'); END;",
+    )
+    .unwrap();
+
+    let next = json!({"unchanged": 1, "changed": "after", "added": 42})
+        .as_object()
+        .unwrap()
+        .clone();
+    write_diff_conn(&conn, &initial, &next).unwrap();
+    assert_eq!(read_conn(&conn).unwrap(), next);
+    assert!(marker_present_conn(&conn, KEY_CONFIG_MIGRATED).unwrap());
+
+    conn.execute_batch(
+        "CREATE TRIGGER reject_bad_key BEFORE INSERT ON kv WHEN NEW.key='zFail' BEGIN SELECT RAISE(ABORT,'injected failure'); END;",
+    )
+    .unwrap();
+    let mut bad = next.clone();
+    bad.insert("changed".into(), json!("rolled-back"));
+    bad.insert("zFail".into(), json!(1));
+    assert!(write_diff_conn(&conn, &next, &bad).is_err());
+    assert_eq!(read_conn(&conn).unwrap(), next);
+}
+
+#[test]
+fn write_single_key_upserts_deletes_and_rejects_reserved() {
+    let conn = database();
+    write_single_key_conn(&conn, "singleKey", Some(&json!({"k": 1}))).unwrap();
+    assert_eq!(read_conn(&conn).unwrap().get("singleKey"), Some(&json!({"k": 1})));
+
+    write_single_key_conn(&conn, "singleKey", Some(&json!("v2"))).unwrap();
+    assert_eq!(read_conn(&conn).unwrap().get("singleKey"), Some(&json!("v2")));
+
+    assert!(write_single_key_conn(&conn, KEY_CONFIG_MIGRATED, Some(&json!(true))).is_err());
+
+    write_single_key_conn(&conn, "singleKey", None).unwrap();
+    assert!(!read_conn(&conn).unwrap().contains_key("singleKey"));
+}

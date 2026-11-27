@@ -1,6 +1,9 @@
 use serde_json::Value;
 
-use super::{model_key_source, plugin_task_grants, save_raw, synced_fingerprint};
+use super::{
+    bump_routing_profiles_generation, model_key_source, plugin_task_grants, save_raw_diff,
+    synced_changed,
+};
 
 pub(crate) fn try_update_raw_field<T, E>(
     key: &str,
@@ -41,19 +44,22 @@ fn try_update_raw_fields_inner<T, E>(
     if next.raw == previous.raw {
         return Ok(result);
     }
-    let fingerprint = synced_fingerprint(&previous.raw);
     model_key_source::before_change(&previous, &next);
     plugin_task_grants::before_change(&previous.raw, &next.raw);
     if next.raw.get(crate::server::core::model_rules::KEY_MODEL_RULES)
         != previous.raw.get(crate::server::core::model_rules::KEY_MODEL_RULES) {
         next.model_rules = std::sync::Arc::new(crate::server::core::model_rules::ModelRules::from_raw(&next.raw));
     }
-    if next.raw.get(super::error_policy::KEY_ERROR_POLICY) != previous.raw.get(super::error_policy::KEY_ERROR_POLICY) {
+    let error_policy_changed = next.raw.get(super::error_policy::KEY_ERROR_POLICY)
+        != previous.raw.get(super::error_policy::KEY_ERROR_POLICY);
+    if error_policy_changed {
         next.error_policy = super::error_policy::from_raw(&next.raw);
         next.retry = super::parse::retry_from(&next.raw);
         next.routing = super::parse::routing_from(&next.raw);
     }
-    if next.raw.get(super::KEY_ROUTING_PROFILES) != previous.raw.get(super::KEY_ROUTING_PROFILES) {
+    let routing_profiles_changed = next.raw.get(super::KEY_ROUTING_PROFILES)
+        != previous.raw.get(super::KEY_ROUTING_PROFILES);
+    if routing_profiles_changed {
         next.routing_profiles = super::routing_profiles::from_raw(&next.raw);
     }
     if next.raw.get(super::compact_routes::KEY_COMPACT_ROUTES) != previous.raw.get(super::compact_routes::KEY_COMPACT_ROUTES) {
@@ -73,12 +79,15 @@ fn try_update_raw_fields_inner<T, E>(
         super::KEY_PROMPT_GATEWAY_TEXT].iter().any(|key| next.raw.get(*key) != previous.raw.get(*key)) {
         next.prompt = super::prompt_from(&next.raw);
     }
-    if !save_raw(&next.raw) {
+    if !save_raw_diff(&previous.raw, &next.raw) {
         return Err(storage_error());
     }
-    let changed = fingerprint != synced_fingerprint(&next.raw);
+    let changed = synced_changed(&previous.raw, &next.raw);
     let catalog_changed = crate::server::core::providers::catalog::config_changed(&previous, &next);
     if catalog_changed { crate::server::core::providers::catalog::invalidate(); }
+    if routing_profiles_changed || error_policy_changed {
+        bump_routing_profiles_generation();
+    }
     let key_snapshot = next.clone();
     if !plugin_task_grants::publish(next) {
         model_key_source::fail_closed();

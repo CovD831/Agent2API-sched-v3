@@ -466,27 +466,43 @@ pub fn mark_result(id: &str, result: Option<Value>) {
     });
 }
 
+/// 一次配置更新同时写入条目级 `lastResult` 与顶层 `autoCheckin.lastResult`。
+pub(crate) fn mark_result_and_summary(id: &str, result: Option<Value>) {
+    let result = result.filter(|value| value.is_object());
+    let top_level = result.clone();
+    auto_checkin::update_state(|state| {
+        apply_entry_mutation(state, id, |schedule| {
+            schedule.last_result = result;
+        });
+        if let Some(summary) = top_level {
+            state.insert("lastResult".to_string(), summary);
+        }
+    });
+}
+
+fn apply_entry_mutation<F: FnOnce(&mut Schedule)>(state: &mut Map<String, Value>, id: &str, apply: F) {
+    if !state.contains_key("schedules") {
+        if id != DEFAULT_SCHEDULE_ID { return; }
+        let mut schedule = legacy_schedule_of(state);
+        apply(&mut schedule);
+        let value = to_value(&schedule);
+        for key in ["accountPlan", "lastFiredDate", "lastFiredProviders", "lastRetriedProviders", "lastResult"] {
+            state.insert(key.to_string(), value[key].clone());
+        }
+        return;
+    }
+    let mut entries = state.get("schedules").and_then(Value::as_array).cloned().unwrap_or_default();
+    let Some(index) = entries.iter().position(|raw| raw.get("id").and_then(Value::as_str) == Some(id)) else { return; };
+    let mut schedule = normalize_schedule(&entries[index]);
+    apply(&mut schedule);
+    entries[index] = to_value(&schedule);
+    state.insert("schedules".to_string(), Value::Array(entries));
+}
+
 /// 改一条条目的去重状态（只动 `apply` 碰的字段）。
 /// 条目键不存在（老配置）且删的是默认条目时落到旧字段，不引入结构变更。
 fn patch_entry<F: FnOnce(&mut Schedule)>(id: &str, apply: F) {
-    auto_checkin::update_state(|state| {
-        if !state.contains_key("schedules") {
-            if id != DEFAULT_SCHEDULE_ID { return; }
-            let mut schedule = legacy_schedule_of(state);
-            apply(&mut schedule);
-            let value = to_value(&schedule);
-            for key in ["accountPlan", "lastFiredDate", "lastFiredProviders", "lastRetriedProviders", "lastResult"] {
-                state.insert(key.to_string(), value[key].clone());
-            }
-            return;
-        }
-        let mut entries = state.get("schedules").and_then(Value::as_array).cloned().unwrap_or_default();
-        let Some(index) = entries.iter().position(|raw| raw.get("id").and_then(Value::as_str) == Some(id)) else { return; };
-        let mut schedule = normalize_schedule(&entries[index]);
-        apply(&mut schedule);
-        entries[index] = to_value(&schedule);
-        state.insert("schedules".to_string(), Value::Array(entries));
-    });
+    auto_checkin::update_state(|state| apply_entry_mutation(state, id, apply));
 }
 
 /* ─── 一次性补齐：新加入的家默认在范围内 ───────────────────

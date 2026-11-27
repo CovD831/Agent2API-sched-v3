@@ -349,16 +349,11 @@ pub(super) fn exhausted_accounts(previous: Option<&Value>, limit: i64) -> Vec<St
 /// `resolve_checkin_targets` 的 `supports_checkin` 与范围过滤决定。
 pub(super) fn unsigned_accounts(store: &AccountStore) -> Vec<String> {
     store
-        .list_accounts()
-        .get("accounts")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter(|account| !crate::server::core::account_store::checkin_state::checked_in_today(account))
-                .filter_map(|account| account.get("id").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+        .routing_snapshot_fresh()
+        .public_accounts
+        .iter()
+        .filter(|account| !crate::server::core::account_store::checkin_state::checked_in_today(account))
+        .filter_map(|account| account.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
 }

@@ -1,16 +1,35 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use serde_json::{json, Value};
 use crate::server::{config, core::{account_order, routing, routing_groups::{self, GroupProjection, RequestNeeds}}};
+
+pub(crate) struct ProjectedRoute {
+    pub profile: Option<Arc<config::RoutingProfile>>,
+    pub excluded_set: Option<Arc<HashSet<String>>>,
+    pub scope: String,
+    pub positions: Arc<HashMap<String, usize>>,
+    pub profiles_gen: u64,
+    pub sort_gen: u64,
+    pub order_gen: u64,
+    pub next_expiry_ms: Option<i64>,
+}
+
+fn build_excluded_set(profile: Option<&config::RoutingProfile>) -> Option<Arc<HashSet<String>>> {
+    profile
+        .filter(|prof| !prof.excluded_accounts.is_empty())
+        .map(|prof| Arc::new(prof.excluded_accounts.iter().cloned().collect()))
+}
 
 #[derive(Clone)]
 pub(crate) struct RequestRouting {
     pub settings: config::RoutingSettings,
-    pub profile: Option<config::RoutingProfile>,
+    pub profile: Option<Arc<config::RoutingProfile>>,
+    pub excluded_set: Option<Arc<HashSet<String>>>,
     pub scope: String,
     pub captured_at: i64,
     pub group: Option<config::RoutingGroup>,
     pub group_projection: GroupProjection,
-    positions: HashMap<String, usize>,
+    positions: Arc<HashMap<String, usize>>,
     account_id: Option<String>,
     require_account: bool,
     pub strict_vision: bool,
@@ -18,25 +37,92 @@ pub(crate) struct RequestRouting {
 }
 
 impl RequestRouting {
-    fn capture_with(model: &str, store: &crate::server::core::account_store::store::AccountStore,
-        profiles: &config::RoutingProfiles, base: config::RoutingSettings) -> Self {
+    fn capture_with(
+        model: &str,
+        store: &crate::server::core::account_store::store::AccountStore,
+        profiles: &config::RoutingProfiles,
+        base: config::RoutingSettings,
+        profiles_gen: u64,
+        sort_gen: u64,
+    ) -> Self {
         let snapshot = store.routing_snapshot();
+        let now = crate::server::logging::now_ms();
+        let order_gen = account_order::revision();
+        let cache_key = config::normalize_routing_model(model).unwrap_or_else(|_| model.trim().to_ascii_lowercase());
+        if let Ok(cache) = snapshot.projected_routes.lock() {
+            if let Some(hit) = cache.get(&cache_key) {
+                if hit.profiles_gen == profiles_gen
+                    && hit.sort_gen == sort_gen
+                    && hit.order_gen == order_gen
+                    && hit.next_expiry_ms.is_none_or(|exp| now < exp)
+                {
+                    return Self {
+                        settings: profiles.settings_for(model, base),
+                        profile: hit.profile.clone(),
+                        excluded_set: hit.excluded_set.clone(),
+                        scope: hit.scope.clone(),
+                        captured_at: now,
+                        group: None,
+                        account_id: None,
+                        require_account: false,
+                        strict_vision: false,
+                        vision_model: None,
+                        group_projection: Default::default(),
+                        positions: hit.positions.clone(),
+                    };
+                }
+            }
+        }
         let accounts: Vec<Value> = snapshot.accounts.iter()
             .filter(|account| crate::server::core::account_store::store_view::account_visible(routing::provider_of(account)))
             .map(|account| account.as_ref().clone()).collect();
+        let sorting = account_order::sorting(&accounts, now);
+        let next_expiry_ms = sorting.credit_expires_at.values().flatten().copied().filter(|&exp| exp > now).min();
         let ordered = if let Some(profile) = profiles.model_profile(model) {
-            crate::server::core::routing_scope::project_accounts(&accounts, profile)
+            crate::server::core::routing_scope::project_accounts_with_sorting(&accounts, profile, &sorting)
         } else {
-            let sorting = account_order::sorting(&accounts, crate::server::logging::now_ms());
             account_order::ordered_accounts(&accounts, &sorting).into_iter().filter(|account| profiles.global.as_ref().map_or(true, |profile|
                 profile.includes_provider(routing::provider_of(account)) && !routing::account_id(account).is_some_and(|id| profile.excluded_accounts.iter().any(|excluded| excluded == id))))
                 .collect()
         };
-        Self { settings: profiles.settings_for(model, base), profile: profiles.effective(model).cloned(),
-            scope: profiles.scope(model).to_string(), captured_at: crate::server::logging::now_ms(), group: None,
-            account_id: None, require_account: false, strict_vision: false, vision_model: None,
-            group_projection: Default::default(), positions: ordered.iter().enumerate().filter_map(|(index, account)|
-                routing::account_id(account).map(|id| (id.to_string(), index))).collect() }
+        let profile = profiles.effective(model).cloned().map(Arc::new);
+        let excluded_set = build_excluded_set(profile.as_deref());
+        let scope = profiles.scope(model).to_string();
+        let positions: Arc<HashMap<String, usize>> = Arc::new(
+            ordered.iter().enumerate()
+                .filter_map(|(index, account)| routing::account_id(account).map(|id| (id.to_string(), index)))
+                .collect(),
+        );
+        let projected = Arc::new(ProjectedRoute {
+            profile: profile.clone(),
+            excluded_set: excluded_set.clone(),
+            scope: scope.clone(),
+            positions: positions.clone(),
+            profiles_gen,
+            sort_gen,
+            order_gen,
+            next_expiry_ms,
+        });
+        if let Ok(mut cache) = snapshot.projected_routes.lock() {
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(cache_key, projected);
+        }
+        Self {
+            settings: profiles.settings_for(model, base),
+            profile,
+            excluded_set,
+            scope,
+            captured_at: now,
+            group: None,
+            account_id: None,
+            require_account: false,
+            strict_vision: false,
+            vision_model: None,
+            group_projection: Default::default(),
+            positions,
+        }
     }
 
     pub fn capture_request(model: &str, store: &crate::server::core::account_store::store::AccountStore,
@@ -47,22 +133,45 @@ impl RequestRouting {
     pub(super) fn capture_request_with_vision(model: &str, store: &crate::server::core::account_store::store::AccountStore,
         body: &Value, scope: Option<&crate::server::core::key_scope::KeyScope>, ignore: bool,
         vision: Option<&config::vision_compat::VisionSettings>) -> Result<Self, crate::server::errors::GatewayError> {
+        Self::capture_request_with_group_id(
+            model,
+            store,
+            body.get("_wb_route_group_id").and_then(Value::as_str),
+            Some(body),
+            scope,
+            ignore,
+            vision,
+        )
+    }
+
+    pub(super) fn capture_request_with_group_id(
+        model: &str,
+        store: &crate::server::core::account_store::store::AccountStore,
+        route_group_id: Option<&str>,
+        body_for_group: Option<&Value>,
+        scope: Option<&crate::server::core::key_scope::KeyScope>,
+        ignore: bool,
+        vision: Option<&config::vision_compat::VisionSettings>,
+    ) -> Result<Self, crate::server::errors::GatewayError> {
+        let profiles_gen = config::routing_profiles_generation();
+        let sort_gen = config::account_sort_generation();
         let (profiles, base) = config::routing_snapshot();
-        if !ignore && body.get("_wb_route_group_id").and_then(Value::as_str).is_some_and(|id|
+        if !ignore && route_group_id.is_some_and(|id|
             !profiles.group_for_model(model).is_some_and(|group| group.id == id)) {
             return Err(crate::server::errors::GatewayError::with_status(409, "路由组已删除或入口已变更，请重新发起请求；未回退其他路由"));
         }
-        let mut routing = Self::capture_with(model, store, &profiles, base);
+        let mut routing = Self::capture_with(model, store, &profiles, base, profiles_gen, sort_gen);
         routing.account_id = scope.and_then(|scope| scope.account_id()).map(str::to_string);
         routing.require_account = scope.is_some_and(|scope| scope.requires_account());
         if let Some(id) = &routing.account_id {
-            routing.positions.retain(|account, _| account == id);
+            Arc::make_mut(&mut routing.positions).retain(|account, _| account == id);
         }
         if !ignore {
             if let Some(group) = profiles.group_for_model(model).cloned() {
                 if !crate::server::core::key_scope::allows_model(scope, &group.model) {
                     return Err(crate::server::errors::GatewayError::with_status(404, "此路由组不在网关 Key 的可用模型列表里").with_code("model_not_found"));
                 }
+                let body = body_for_group.unwrap_or(&Value::Null);
                 let snapshot = store.routing_snapshot();
                 let accounts: Vec<_> = snapshot.accounts.iter().map(|account| account.as_ref().clone()).collect();
                 routing.group_projection = routing_groups::project_with_vision(&group, &accounts, &RequestNeeds::from_body(body), scope, vision);
@@ -74,7 +183,9 @@ impl RequestRouting {
                     });
                 }
                 routing.settings = group.settings(base);
-                routing.profile = Some(group.profile());
+                let group_profile = Arc::new(group.profile());
+                routing.excluded_set = build_excluded_set(Some(group_profile.as_ref()));
+                routing.profile = Some(group_profile);
                 routing.scope = group.model.clone();
                 routing.group = Some(group);
             }
@@ -156,7 +267,7 @@ impl RequestRouting {
                 return Err(GatewayError::with_status(403, "视觉提供商未参与所选路由，请检查目标模型的路由配置")
                     .with_code("vision_target_outside_route"));
             }
-            next.positions.retain(|id, _| pinned.is_none_or(|pinned| pinned == id));
+            Arc::make_mut(&mut next.positions).retain(|id, _| pinned.is_none_or(|pinned| pinned == id));
             if next.positions.is_empty() {
                 return Err(GatewayError::with_status(503, "当前权限和目标路由内没有参与图片处理的账号")
                     .with_code("vision_target_unavailable"));
@@ -184,5 +295,111 @@ impl RequestRouting {
                 "id": member.id, "provider": member.provider, "model": member.model, "included": member.included,
                 "accountCount": member.accounts.len(),
             })).collect::<Vec<_>>()) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use serde_json::json;
+    use crate::server::{
+        config,
+        core::{account_order, account_store::AccountStore, upstream::route_context::RequestRouting},
+        db::Db,
+    };
+
+    #[test]
+    fn projected_route_cache_hits_and_invalidates_across_dimensions() {
+        crate::test_support::isolated(
+            concat!(
+                module_path!(),
+                "::projected_route_cache_hits_and_invalidates_across_dimensions"
+            ),
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = Db::open(&dir.path().join("route-cache.db")).unwrap();
+                config::init(Some(db.clone()));
+                let store = AccountStore::with_db(Some(db));
+
+                let a1 = store
+                    .add_custom_account("custom-p1", &json!({"apiKey": "sk-1"}), Some("A1"))
+                    .unwrap()
+                    .account;
+                let id1 = a1["id"].as_str().unwrap().to_string();
+                let _a2 = store
+                    .add_custom_account("custom-p1", &json!({"apiKey": "sk-2"}), Some("A2"))
+                    .unwrap()
+                    .account;
+
+                let r1 = RequestRouting::capture_request("gpt-test", &store, &json!({}), None, false)
+                    .unwrap();
+                let r2 = RequestRouting::capture_request("GPT-Test", &store, &json!({}), None, false)
+                    .unwrap();
+                assert!(
+                    Arc::ptr_eq(&r1.positions, &r2.positions),
+                    "repeated normalized model request must reuse cached ProjectedRoute positions"
+                );
+                assert!(r1.positions.contains_key(&id1));
+
+                let a3 = store
+                    .add_custom_account("custom-p1", &json!({"apiKey": "sk-3"}), Some("A3"))
+                    .unwrap()
+                    .account;
+                let id3 = a3["id"].as_str().unwrap().to_string();
+                let r3 = RequestRouting::capture_request("gpt-test", &store, &json!({}), None, false)
+                    .unwrap();
+                assert!(
+                    !Arc::ptr_eq(&r2.positions, &r3.positions),
+                    "account_revision change must invalidate ProjectedRoute cache"
+                );
+                assert!(r3.positions.contains_key(&id3));
+
+                let r4 = RequestRouting::capture_request("gpt-test", &store, &json!({}), None, false)
+                    .unwrap();
+                assert!(Arc::ptr_eq(&r3.positions, &r4.positions));
+
+                assert!(config::update_raw_field(
+                    config::KEY_ROUTING_PROFILES,
+                    json!({
+                        "models": {
+                            "gpt-test": {
+                                "providerScope": "selected",
+                                "providers": ["custom-p1"]
+                            }
+                        }
+                    }),
+                ));
+                let r5 = RequestRouting::capture_request("gpt-test", &store, &json!({}), None, false)
+                    .unwrap();
+                assert!(
+                    !Arc::ptr_eq(&r4.positions, &r5.positions),
+                    "routing_profiles_generation bump must invalidate ProjectedRoute cache"
+                );
+
+                let r6 = RequestRouting::capture_request("gpt-test", &store, &json!({}), None, false)
+                    .unwrap();
+                assert!(Arc::ptr_eq(&r5.positions, &r6.positions));
+
+                assert!(config::update_raw_field("accountSort", json!({"mode": "balance"})));
+                let r7 = RequestRouting::capture_request("gpt-test", &store, &json!({}), None, false)
+                    .unwrap();
+                assert!(
+                    !Arc::ptr_eq(&r6.positions, &r7.positions),
+                    "account_sort_generation bump must invalidate ProjectedRoute cache"
+                );
+
+                let r8 = RequestRouting::capture_request("gpt-test", &store, &json!({}), None, false)
+                    .unwrap();
+                assert!(Arc::ptr_eq(&r7.positions, &r8.positions));
+
+                account_order::note_usage(&id1, &json!({"totalLeft": 50.0}), "");
+                let r9 = RequestRouting::capture_request("gpt-test", &store, &json!({}), None, false)
+                    .unwrap();
+                assert!(
+                    !Arc::ptr_eq(&r8.positions, &r9.positions),
+                    "account_order::revision() bump must invalidate ProjectedRoute cache"
+                );
+            },
+        );
     }
 }

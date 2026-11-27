@@ -74,7 +74,15 @@ pub fn apply_accounts(accounts: &[Value], model: &str) -> Vec<Value> {
 
 pub fn project_accounts(accounts: &[Value], profile: &RoutingProfile) -> Vec<Value> {
     let sorting = account_order::sorting(accounts, crate::server::logging::now_ms());
-    let baseline = account_order::ordered_accounts(accounts, &sorting);
+    project_accounts_with_sorting(accounts, profile, &sorting)
+}
+
+pub(crate) fn project_accounts_with_sorting(
+    accounts: &[Value],
+    profile: &RoutingProfile,
+    sorting: &account_order::AccountSorting,
+) -> Vec<Value> {
+    let baseline = account_order::ordered_accounts(accounts, sorting);
     let mut providers = profile.providers.clone();
     if profile.scope() == RoutingProviderScope::All {
         for provider in &sorting.provider_order {

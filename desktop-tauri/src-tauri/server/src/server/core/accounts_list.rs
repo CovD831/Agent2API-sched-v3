@@ -115,7 +115,7 @@ pub fn page(store: &AccountStore, query: &AccountListQuery, ids_only: bool) -> V
         let expired = expiry > 0 && expiry <= now;
         let soon = expiry > now && expiry <= now + 7 * 86_400_000;
         let long_lived = feature["long_lived"] == true;
-        let usage_state = usage_state(account, usage.get(routing::account_id(account).unwrap_or("")));
+        let usage_state = usage_state(account, usage.get(routing::account_id(account).unwrap_or("")).map(std::sync::Arc::as_ref));
         let search = matches_query(account, &keyword, feature, query.mobile);
         if query.mobile && search {
             increment(&mut mobile_counts["status"], "all");

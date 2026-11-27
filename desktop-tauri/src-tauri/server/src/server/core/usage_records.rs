@@ -174,7 +174,7 @@ pub fn load_all() -> HashMap<String, UsageRecord> {
     .unwrap_or_default()
 }
 
-pub(crate) fn cached_snapshot() -> Arc<HashMap<String, UsageRecord>> {
+pub(crate) fn cached_snapshot() -> Arc<HashMap<String, Arc<UsageRecord>>> {
     cache::snapshot()
 }
 
@@ -188,12 +188,9 @@ pub fn balance_facts() -> HashMap<String, BalanceFact> {
 
 // ─── 写 ──────────────────────────────────────────────────────
 
-/// 记一笔「尝试开始」（心跳路径在**发请求之前**调用，见模块头）。
-/// 只推进时间戳，不动上一次的结果 —— 查询还没回来，旧读数仍是最新事实。
-pub fn mark_attempt(account_id: &str) {
-    let now = logging::now_ms();
-    let Some(db) = database() else { return };
-    let failed = db.with_mut(|conn| {
+pub(crate) fn mark_attempt_in(db: &Db, cache: &cache::Cache, account_id: &str, now: i64) -> bool {
+    let revisions = db.with_mut(|conn| -> Option<(u64, u64)> {
+        let rev_before = db.usage_revision();
         conn.execute(
             "INSERT INTO account_usage_records (account_id, last_attempt_at, updated_at)
              VALUES (?1, ?2, ?2)
@@ -202,23 +199,31 @@ pub fn mark_attempt(account_id: &str) {
                updated_at = excluded.updated_at",
             params![account_id, now],
         )
-        .is_err()
-    });
-    if failed != Some(false) {
-        logging::verbose("[Usage]", &format!("账号 {account_id} 余额查询占位失败（库里没记上本次尝试）"));
+        .ok()?;
+        Some((rev_before, db.usage_revision()))
+    }).flatten();
+    if let Some((rev_before, rev_after)) = revisions {
+        cache.note_attempt_with(db, account_id, now, rev_before, rev_after);
+        true
+    } else {
+        false
     }
 }
 
-/// 写入一次查询的结果（成功覆写数值，失败只写原因 —— 见模块头的取舍）。
-/// 内存事实表同步更新：成功且有数字 → 刷新；成功但判不出（unlimited / 形状不认）
-/// → 摘除（不能让一个过期的旧数字把账号永久挡在选路之外）。
-pub fn write_result(account_id: &str, outcome: &UsageOutcome, query_config: &str, request_id: &str) -> bool {
+pub(crate) fn write_result_in(
+    db: &Db,
+    cache: &cache::Cache,
+    account_id: &str,
+    outcome: &UsageOutcome,
+    query_config: &str,
+    request_id: &str,
+) -> Option<(bool, Option<f64>)> {
     let now = logging::now_ms();
-    let Some(db) = database() else { return false };
-    // 闭包返回 `(是否成功, 成功时提出的数字)`：失败分支只写原因、保留旧数值
-    // （SQL 里就不碰 usage / remaining / last_success 三列），事实表按它更新。
+    // 闭包返回 `(是否成功, 成功时提出的数字, 更新后的单条记录, rev_before, rev_after)`：
+    // 失败分支只写原因、保留旧数值（SQL 里就不碰 usage / remaining / last_success 三列）。
     // `with_mut` 本身再包一层 Option（锁中毒 = None），match 前先 flatten。
-    let written = db.with_mut(|conn| -> Option<(bool, Option<f64>)> {
+    let written = db.with_mut(|conn| -> Option<(bool, Option<f64>, Option<UsageRecord>, u64, u64)> {
+        let rev_before = db.usage_revision();
         match outcome.usage.as_ref() {
             Some(usage) => {
                 let (remaining, unlimited) = extract_remaining(usage);
@@ -243,7 +248,19 @@ pub fn write_result(account_id: &str, outcome: &UsageOutcome, query_config: &str
                     params![account_id, usage_text, remaining, unlimited as i64, now, query_config, request_id],
                 )
                 .ok()?;
-                Some((true, remaining))
+                let updated = UsageRecord {
+                    usage: Some(usage.clone()),
+                    error: None,
+                    diagnostics: None,
+                    code: None,
+                    remaining,
+                    unlimited,
+                    last_success_at: now,
+                    last_attempt_at: now,
+                    query_config: query_config.to_string(),
+                    query_request_id: request_id.to_string(),
+                };
+                Some((true, remaining, Some(updated), rev_before, db.usage_revision()))
             }
             None => {
                 let error = outcome.error.as_deref().unwrap_or("查询失败");
@@ -263,11 +280,41 @@ pub fn write_result(account_id: &str, outcome: &UsageOutcome, query_config: &str
                     params![account_id, error, outcome.code, now, request_id, diagnostics],
                 )
                 .ok()?;
-                Some((false, None))
+                let updated = conn
+                    .query_row(
+                        &format!("SELECT {RECORD_COLUMNS} FROM account_usage_records WHERE account_id = ?1"),
+                        [account_id],
+                        row_to_record,
+                    )
+                    .ok();
+                Some((false, None, updated, rev_before, db.usage_revision()))
             }
         }
     })
     .flatten();
+    let (ok, remaining, updated, rev_before, rev_after) = written?;
+    if let Some(record) = updated {
+        cache.note_updated_with(db, account_id, record, rev_before, rev_after);
+    }
+    Some((ok, remaining))
+}
+
+/// 记一笔「尝试开始」（心跳路径在**发请求之前**调用，见模块头）。
+/// 只推进时间戳，不动上一次的结果 —— 查询还没回来，旧读数仍是最新事实。
+pub fn mark_attempt(account_id: &str) {
+    let now = logging::now_ms();
+    let Some(db) = database() else { return };
+    if !mark_attempt_in(&db, cache::global(), account_id, now) {
+        logging::verbose("[Usage]", &format!("账号 {account_id} 余额查询占位失败（库里没记上本次尝试）"));
+    }
+}
+
+/// 写入一次查询的结果（成功覆写数值，失败只写原因 —— 见模块头的取舍）。
+/// 内存事实表同步更新：成功且有数字 → 刷新；成功但判不出（unlimited / 形状不认）
+/// → 摘除（不能让一个过期的旧数字把账号永久挡在选路之外）。
+pub fn write_result(account_id: &str, outcome: &UsageOutcome, query_config: &str, request_id: &str) -> bool {
+    let Some(db) = database() else { return false };
+    let written = write_result_in(&db, cache::global(), account_id, outcome, query_config, request_id);
     if matches!(written, Some((true, _))) {
         if let Some(usage) = &outcome.usage {
             crate::server::core::limiter::sources::note(account_id, usage, query_config);
@@ -587,6 +634,126 @@ pub(crate) fn reload_facts() {
         .collect();
     if let Ok(mut slot) = facts_slot().lock() {
         *slot = facts;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use serde_json::json;
+    use super::{cache, mark_attempt_in, write_result_in, UsageOutcome};
+    use crate::server::db::Db;
+
+    #[test]
+    fn incremental_cache_updates_and_invalidates_on_interleaved_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("usage-cache.db")).unwrap();
+        let cache = cache::Cache::default();
+
+        assert!(write_result_in(
+            &db,
+            &cache,
+            "acc-1",
+            &UsageOutcome {
+                usage: Some(json!({ "totalLeft": 100.0 })),
+                error: None,
+                code: None,
+                diagnostics: None,
+            },
+            "cfg-1",
+            "req-seed-1",
+        )
+        .is_some());
+        assert!(write_result_in(
+            &db,
+            &cache,
+            "acc-2",
+            &UsageOutcome {
+                usage: Some(json!({ "totalLeft": 250.0 })),
+                error: None,
+                code: None,
+                diagnostics: None,
+            },
+            "cfg-2",
+            "req-seed-2",
+        )
+        .is_some());
+
+        let snap1 = cache.snapshot_with(&db);
+        assert!(cache.is_cached());
+        assert_eq!(snap1["acc-1"].remaining, Some(100.0));
+        assert_eq!(snap1["acc-2"].remaining, Some(250.0));
+
+        let t1 = 1_700_000_000_123_i64;
+        assert!(mark_attempt_in(&db, &cache, "acc-1", t1));
+        let snap2 = cache.snapshot_with(&db);
+        assert_eq!(snap2["acc-1"].last_attempt_at, t1);
+        assert!(Arc::ptr_eq(&snap1["acc-2"], &snap2["acc-2"]));
+
+        assert!(write_result_in(
+            &db,
+            &cache,
+            "acc-1",
+            &UsageOutcome {
+                usage: Some(json!({ "totalLeft": 88.5 })),
+                error: None,
+                code: None,
+                diagnostics: None,
+            },
+            "cfg-1",
+            "req-1",
+        )
+        .is_some());
+        let snap3 = cache.snapshot_with(&db);
+        assert_eq!(snap3["acc-1"].remaining, Some(88.5));
+        assert!(snap3["acc-1"].last_success_at > 0);
+        assert!(Arc::ptr_eq(&snap2["acc-2"], &snap3["acc-2"]));
+
+        let prev_success_at = snap3["acc-1"].last_success_at;
+        assert!(write_result_in(
+            &db,
+            &cache,
+            "acc-1",
+            &UsageOutcome {
+                usage: None,
+                error: Some("quota exhausted".into()),
+                code: Some("429".into()),
+                diagnostics: None,
+            },
+            "cfg-1",
+            "req-2",
+        )
+        .is_some());
+        let snap4 = cache.snapshot_with(&db);
+        assert_eq!(snap4["acc-1"].error.as_deref(), Some("quota exhausted"));
+        assert_eq!(snap4["acc-1"].code.as_deref(), Some("429"));
+        assert_eq!(snap4["acc-1"].remaining, Some(88.5));
+        assert_eq!(snap4["acc-1"].last_success_at, prev_success_at);
+        assert!(snap4["acc-1"].usage.is_some());
+
+        // 模拟绕过缓存的并发直接写表：revision 错序时必须整份清缓存并重新加载真实库状态
+        let direct_rev_after = db
+            .with_mut(|conn| {
+                conn.execute(
+                    "UPDATE account_usage_records SET remaining = 12.0 WHERE account_id = 'acc-2'",
+                    [],
+                )
+                .unwrap();
+                db.usage_revision()
+            })
+            .unwrap();
+        let mutated_acc1 = (*snap4["acc-1"]).clone();
+        cache.note_updated_with(
+            &db,
+            "acc-1",
+            mutated_acc1,
+            direct_rev_after,
+            direct_rev_after.wrapping_add(1),
+        );
+        assert!(!cache.is_cached());
+
+        let snap5 = cache.snapshot_with(&db);
+        assert_eq!(snap5["acc-2"].remaining, Some(12.0));
     }
 }
 

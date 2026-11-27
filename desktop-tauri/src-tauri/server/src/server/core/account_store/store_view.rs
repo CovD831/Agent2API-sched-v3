@@ -17,6 +17,7 @@
 //! 这些方法仍是 `impl AccountStore` 的分块（同一个类型，跨文件不改变可见性）。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
@@ -200,8 +201,8 @@ impl AccountStore {
     /// 上就给出**，前端不必再发第二个请求。计数是各 provider 的账号**总数**
     /// （含禁用账号）—— 与分组标题显示的「N 个账号」口径一致。
     pub fn list_accounts(&self) -> Value {
-        let state = self.read_state();
-        self.snapshot(&state, Visibility::All)
+        let snapshot = self.routing_snapshot_fresh();
+        self.snapshot_from_public(&snapshot.public_accounts, Visibility::All)
     }
 
     /// 界面用的账号快照：**只含此刻真的能用的那些家**（判据见 [`account_visible`]）。
@@ -210,8 +211,8 @@ impl AccountStore {
     /// 签到中心、成长页…）。没装插件时插件家的账号不出现 —— 用户明确要的是
     /// 「插件不在，这家就不存在」；数据仍在库里，装上插件原样回来。
     pub fn list_visible_accounts(&self) -> Value {
-        let state = self.read_state();
-        self.snapshot(&state, Visibility::UserFacing)
+        let snapshot = self.routing_snapshot_fresh();
+        self.snapshot_from_public(&snapshot.public_accounts, Visibility::UserFacing)
     }
 
     /// 全部账号 proxy 指向的池条目 id 集合（去重）。
@@ -341,6 +342,78 @@ impl AccountStore {
                 .map(|record| self.public_account(record))
                 .collect::<Vec<_>>(),
             "providers": self.provider_summary(&visible),
+            "hiddenAccounts": hidden,
+        });
+        crate::server::core::account_order::enrich_snapshot(&mut snapshot);
+        snapshot
+    }
+
+    /// 基于 `RoutingSnapshot.public_accounts` 组装与 [`Self::snapshot`] 逐字段一致的列表响应，
+    /// 避免每轮全表 AES-GCM 解密、解析与锁竞争。
+    pub(crate) fn snapshot_from_public(
+        &self,
+        public_accounts: &[Arc<Value>],
+        visibility: Visibility,
+    ) -> Value {
+        let mut visible: Vec<&Arc<Value>> = Vec::with_capacity(public_accounts.len());
+        let mut hidden: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let booting = crate::server::core::plugin_host::startup::booting();
+        for account in public_accounts {
+            let provider = crate::server::core::routing::provider_of(account);
+            if visibility == Visibility::All || account_list_visible(provider, booting) {
+                visible.push(account);
+            } else {
+                *hidden.entry(provider.to_string()).or_insert(0) += 1;
+            }
+        }
+
+        let mut best_by_provider: HashMap<&str, Option<((i64, i64), &str)>> = HashMap::new();
+        let mut best_global: Option<((i64, i64), &str)> = None;
+        for account in &visible {
+            let provider = crate::server::core::routing::provider_of(account);
+            let slot = best_by_provider.entry(provider).or_insert(None);
+            let enabled = account.get("enabled").and_then(Value::as_bool) != Some(false);
+            let has_creds = account.get("hasCredentials").and_then(Value::as_bool) == Some(true);
+            if !enabled || !has_creds {
+                continue;
+            }
+            let Some(id) = account.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let key = super::store::route_order_key(account);
+            if slot.as_ref().is_none_or(|(best_key, _)| key < *best_key) {
+                *slot = Some((key, id));
+            }
+            let chat_supported =
+                account.get("chatSupported").and_then(Value::as_bool) == Some(true);
+            if chat_supported
+                && best_global
+                    .as_ref()
+                    .is_none_or(|(best_key, _)| key < *best_key)
+            {
+                best_global = Some((key, id));
+            }
+        }
+
+        let mut current_ids = Map::new();
+        for (provider, best) in best_by_provider {
+            let head = best
+                .map(|(_, id)| Value::String(id.to_string()))
+                .unwrap_or(Value::Null);
+            current_ids.insert(provider.to_string(), head);
+        }
+        let global_current = best_global
+            .map(|(_, id)| Value::String(id.to_string()))
+            .unwrap_or(Value::Null);
+        let hidden = super::hidden_accounts::summary(hidden);
+        let accounts: Vec<Value> = visible.iter().map(|account| (***account).clone()).collect();
+        let providers = self.provider_summary_from_public(&visible);
+        let mut snapshot = json!({
+            "currentAccountId": global_current,
+            "currentAccountIds": Value::Object(current_ids),
+            "accounts": accounts,
+            "providers": providers,
             "hiddenAccounts": hidden,
         });
         crate::server::core::account_order::enrich_snapshot(&mut snapshot);
@@ -724,6 +797,29 @@ impl AccountStore {
         Value::Array(value)
     }
 
+    fn provider_summary_from_public(&self, accounts: &[&Arc<Value>]) -> Value {
+        let counts: Vec<(String, usize)> = accounts.iter().fold(Vec::new(), |mut acc, account| {
+            let provider = crate::server::core::routing::provider_of(account);
+            match acc.iter_mut().find(|(id, _)| id == provider) {
+                Some((_, count)) => *count += 1,
+                None => acc.push((provider.to_string(), 1)),
+            }
+            acc
+        });
+        let ids: Vec<String> = counts.iter().map(|(id, _)| id.clone()).collect();
+        let value = crate::server::core::providers::summary_json(
+            |id| {
+                counts
+                    .iter()
+                    .find(|(known, _)| known == id)
+                    .map(|(_, count)| *count)
+                    .unwrap_or(0)
+            },
+            &ids,
+        );
+        Value::Array(value)
+    }
+
     // ─── 按 provider 查询 ────────────────────────────────────
 
     /// 指定 provider 的启用账号（公开形态，按 priority、addedAt 升序）。
@@ -740,16 +836,19 @@ impl AccountStore {
     /// auth.json，同样算「有凭证」，见 `state.rs` 的说明）。返回值是**排序后**的：
     /// 调用方按序尝试即可，不必自己再排一遍 —— 优先级的相对顺序就是主备顺序。
     pub fn accounts_for_provider(&self, provider: &str) -> Vec<Value> {
-        let records = self.read_provider(provider);
-        let mut records: Vec<StoredAccount> = records
-            .into_iter()
-            .filter(|record| record.enabled() && record.has_credentials())
-            .collect();
-        records.sort_by_key(StoredAccount::order_key);
-        records
+        let snapshot = self.routing_snapshot_fresh();
+        let mut accounts: Vec<Value> = snapshot
+            .public_accounts
             .iter()
-            .map(|record| self.public_account(record))
-            .collect()
+            .filter(|account| {
+                crate::server::core::routing::provider_of(account) == provider
+                    && account.get("enabled").and_then(Value::as_bool) != Some(false)
+                    && account.get("hasCredentials").and_then(Value::as_bool) == Some(true)
+            })
+            .map(|account| (**account).clone())
+            .collect();
+        accounts.sort_by_key(super::store::route_order_key);
+        accounts
     }
 
     /// 自定义提供商账号的公开形态（`custom_accounts` 写入的记录 → 界面形状）。
@@ -986,5 +1085,76 @@ mod tests {
         assert_eq!(display_name_of(&value, "id-1"), "u-77");
         let empty = fields(json!({ "provider": "raccoon" }));
         assert_eq!(display_name_of(&empty, "id-9"), "id-9");
+    }
+
+    #[test]
+    fn cached_list_matches_uncached_snapshot_across_mutations() {
+        use crate::server::core::account_store::AccountStore;
+        use crate::server::db::Db;
+        use super::Visibility;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("accounts.db")).unwrap();
+        let store = AccountStore::with_db(Some(db));
+
+        let c1 = store
+            .add_custom_account("custom-p1", &json!({"apiKey": "sk-1"}), Some("Custom One"))
+            .unwrap()
+            .account;
+        let id1 = c1["id"].as_str().unwrap().to_string();
+        let _c2 = store
+            .add_custom_account("custom-p2", &json!({"apiKey": "sk-2"}), Some("Custom Two"))
+            .unwrap()
+            .account;
+        let _hidden = store
+            .add_account(
+                &json!({"auth": {"accessToken": "at"}, "account": {"uid": "wb-hidden"}}),
+                Some("Hidden WB"),
+                None,
+            )
+            .unwrap();
+
+        let assert_matches = |label: &str| {
+            let guard = store.guard();
+            let state = store.load(&guard);
+            let expected_all = store.snapshot(&state, Visibility::All);
+            let expected_visible = store.snapshot(&state, Visibility::UserFacing);
+            drop(guard);
+
+            let actual_all = store.list_accounts();
+            let actual_visible = store.list_visible_accounts();
+            for key in [
+                "currentAccountId",
+                "currentAccountIds",
+                "accounts",
+                "providers",
+                "hiddenAccounts",
+            ] {
+                assert_eq!(actual_all.get(key), expected_all.get(key), "{label} list_accounts.{key}");
+                assert_eq!(
+                    actual_visible.get(key),
+                    expected_visible.get(key),
+                    "{label} list_visible_accounts.{key}"
+                );
+            }
+            for (kind, actual, expected) in [
+                ("list_accounts", &actual_all, &expected_all),
+                ("list_visible_accounts", &actual_visible, &expected_visible),
+            ] {
+                let mut actual_sort = actual.get("sorting").cloned().unwrap();
+                let mut expected_sort = expected.get("sorting").cloned().unwrap();
+                assert!(actual_sort.as_object_mut().unwrap().remove("updatedAt").is_some());
+                assert!(expected_sort.as_object_mut().unwrap().remove("updatedAt").is_some());
+                assert_eq!(actual_sort, expected_sort, "{label} {kind}.sorting");
+            }
+        };
+
+        assert_matches("initial");
+        store
+            .update_account(&id1, &json!({"priority": 50, "name": "Renamed"}))
+            .unwrap();
+        assert_matches("updated");
+        store.remove_account(&id1).unwrap();
+        assert_matches("removed");
     }
 }

@@ -69,6 +69,7 @@ pub(crate) fn migrate(store: &AccountStore, expected: &str) -> Result<(), String
     next.raw_mut().insert(config::KEY_ROUTING_PROFILES.into(), serialized);
     next.routing_profiles = Arc::new(profiles);
     crate::server::core::providers::catalog::invalidate();
+    crate::server::config::bump_routing_profiles_generation();
     *config::CONFIG.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next);
     crate::server::core::providers::catalog::invalidate();
     drop(guard);

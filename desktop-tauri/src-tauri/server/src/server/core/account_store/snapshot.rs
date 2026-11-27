@@ -15,6 +15,7 @@ pub(super) struct SnapshotCache {
 struct CachedSnapshot {
     revision: u64,
     metadata: u64,
+    beijing_day: String,
     checked_at: Instant,
     rows: Arc<BTreeMap<i64, Arc<Value>>>,
     snapshot: Arc<RoutingSnapshot>,
@@ -28,6 +29,7 @@ pub(crate) struct RoutingSnapshot {
     pub public_by_id: HashMap<String, Arc<Value>>,
     pub available_providers: HashSet<String>,
     pub forwarding_providers: HashSet<String>,
+    pub(crate) projected_routes: std::sync::Mutex<HashMap<String, Arc<crate::server::core::upstream::route_context::ProjectedRoute>>>,
 }
 
 impl RoutingSnapshot {
@@ -53,7 +55,16 @@ impl RoutingSnapshot {
             let provider = crate::server::core::routing::provider_of(account);
             by_provider.entry(provider.to_string()).or_default().push(account.clone());
         }
-        Self { accounts, by_id, by_provider, public_accounts, public_by_id, available_providers, forwarding_providers }
+        Self {
+            accounts,
+            by_id,
+            by_provider,
+            public_accounts,
+            public_by_id,
+            available_providers,
+            forwarding_providers,
+            projected_routes: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -62,10 +73,25 @@ impl AccountStore {
         let Some(db) = self.database() else { return empty() };
         let cache = self.snapshot_cache();
         let metadata = crate::server::core::providers::catalog::generation();
-        if let Some(snapshot) = fresh(cache, db.account_revision(), metadata) { return snapshot; }
+        let today_day = crate::server::core::beijing::today_key();
+        if let Some(snapshot) = fresh(cache, db.account_revision(), metadata, &today_day) { return snapshot; }
         // 0027 stale-while-revalidate：已有旧快照时非阻塞抢 build 锁，未抢到者立即返回旧快照，彻底消除重建惊群。
         if let Some(stale) = cached_snapshot(cache) {
             return crate::server::core::blocking::in_place(|| self.build_or_stale(db, stale));
+        }
+        crate::server::core::blocking::in_place(|| self.build_routing_snapshot(db))
+    }
+
+    /// 强一致快照读取（供管理界面列表、余额查询、签到与选路校验等调用）：
+    /// `account_revision` / `catalog::generation` / 北京日期未变时零 SQLite 零解密命中缓存；
+    /// 发生变化时仅增量读取变更行（`read_rows::changed`），保证写后立即可读。
+    pub(crate) fn routing_snapshot_fresh(&self) -> Arc<RoutingSnapshot> {
+        let Some(db) = self.database() else { return empty() };
+        let cache = self.snapshot_cache();
+        let metadata = crate::server::core::providers::catalog::generation();
+        let today_day = crate::server::core::beijing::today_key();
+        if let Some(snapshot) = fresh(cache, db.account_revision(), metadata, &today_day) {
+            return snapshot;
         }
         crate::server::core::blocking::in_place(|| self.build_routing_snapshot(db))
     }
@@ -87,16 +113,17 @@ impl AccountStore {
     fn build_locked(&self, db: &crate::server::db::Db, _build: std::sync::MutexGuard<'_, ()>) -> Arc<RoutingSnapshot> {
         let cache = self.snapshot_cache();
         let metadata = crate::server::core::providers::catalog::generation();
-        if let Some(snapshot) = fresh(cache, db.account_revision(), metadata) { return snapshot; }
+        let today_day = crate::server::core::beijing::today_key();
+        if let Some(snapshot) = fresh(cache, db.account_revision(), metadata, &today_day) { return snapshot; }
         let previous = cache.state.read().ok().and_then(|state| state.as_ref().map(|cached| {
-            (cached.revision, cached.metadata, cached.rows.clone())
+            (cached.revision, cached.metadata, cached.beijing_day.clone(), cached.rows.clone())
         }));
         // 0027：不再依赖全库 PRAGMA data_version（requests 表写入会令其持续失效导致反复全量解密），
         // 仅依赖 accounts 表专属的 account_revision + 行级 update_hook journal。
         let batch = db.with(|conn| -> rusqlite::Result<_> {
-            let since = previous.as_ref().filter(|(_, old_metadata, _)| {
-                *old_metadata == metadata
-            }).map(|(revision, _, _)| *revision);
+            let since = previous.as_ref().filter(|(_, old_metadata, old_day, _)| {
+                *old_metadata == metadata && *old_day == today_day
+            }).map(|(revision, _, _, _)| *revision);
             let changes = db.account_changes(since);
             let (replace, rows, unchanged) = match changes.rows {
                 Some(ids) => {
@@ -118,7 +145,7 @@ impl AccountStore {
             }
         }
         let mut rows = if replace { BTreeMap::new() } else {
-            previous.map(|(_, _, rows)| (*rows).clone()).unwrap_or_default()
+            previous.map(|(_, _, _, rows)| (*rows).clone()).unwrap_or_default()
         };
         let mut failed = 0;
         for (rowid, raw) in changes {
@@ -139,6 +166,7 @@ impl AccountStore {
             *state = Some(CachedSnapshot {
                 revision,
                 metadata,
+                beijing_day: today_day,
                 checked_at: Instant::now(),
                 rows: Arc::new(rows),
                 snapshot: snapshot.clone(),
@@ -162,11 +190,14 @@ impl AccountStore {
     }
 }
 
-fn fresh(cache: &SnapshotCache, revision: u64, metadata: u64) -> Option<Arc<RoutingSnapshot>> {
+fn fresh(cache: &SnapshotCache, revision: u64, metadata: u64, today_day: &str) -> Option<Arc<RoutingSnapshot>> {
     let state = cache.state.read().ok()?;
     let cached = state.as_ref()?;
-    (cached.revision == revision && cached.metadata == metadata
-        && cached.checked_at.elapsed() < Duration::from_secs(10)).then(|| cached.snapshot.clone())
+    (cached.revision == revision
+        && cached.metadata == metadata
+        && cached.beijing_day == today_day
+        && cached.checked_at.elapsed() < Duration::from_secs(10))
+        .then(|| cached.snapshot.clone())
 }
 
 fn cached_snapshot(cache: &SnapshotCache) -> Option<Arc<RoutingSnapshot>> {

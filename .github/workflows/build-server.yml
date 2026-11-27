@@ -20,12 +20,14 @@ on:
       server_opt_level:
         description: "opt-level for agent2api-server crate"
         required: false
-        default: "1"
+        default: "2"
         type: choice
         options:
+          - "2"
+          - "3"
+          - "s"
           - "1"
           - "0"
-          - "s"
       publish_release:
         description: "Publish GitHub Release tarball"
         required: false
@@ -43,7 +45,7 @@ concurrency:
 jobs:
   build-linux-amd64:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -68,7 +70,7 @@ jobs:
           else
             TAG="sha-${SHA:0:7}"
           fi
-          OPT_LEVEL="${INPUT_OPT_LEVEL:-1}"
+          OPT_LEVEL="${INPUT_OPT_LEVEL:-2}"
           IMAGE_REPO="ghcr.io/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')/agent2api-server"
           if [ "$INPUT_PUBLISH_RELEASE" = "true" ] || [ "$REF_TYPE" = "tag" ]; then
             PUBLISH_RELEASE="true"
@@ -126,20 +128,46 @@ jobs:
               cd /build/desktop-tauri/src-tauri
               set -- \
                 --release --bin agent2api-server -p agent2api-server \
-                --config "profile.release.opt-level=1" \
-                --config "profile.release.codegen-units=16" \
-                --config "profile.release.lto=false" \
                 --config "profile.release.debug=0" \
                 --config "patch.\"https://github.com/ProvidersPlugin/Agent2Providers\".agent2api-provider-protocol.path=\"/build/Agent2Providers/crates/provider-protocol\""
-              if [ "$SERVER_OPT_LEVEL" = "0" ]; then
-                set -- "$@" \
-                  --config "profile.release.package.agent2api-server.opt-level=0" \
-                  --config "profile.release.package.agent2api-server.codegen-units=64"
-              elif [ "$SERVER_OPT_LEVEL" = "s" ]; then
-                set -- "$@" \
-                  --config "profile.release.package.agent2api-server.opt-level=\"s\"" \
-                  --config "profile.release.package.agent2api-server.codegen-units=8"
-              fi
+              case "$SERVER_OPT_LEVEL" in
+                2)
+                  set -- "$@" \
+                    --config "profile.release.opt-level=2" \
+                    --config "profile.release.codegen-units=8" \
+                    --config "profile.release.lto=\"thin\""
+                  ;;
+                3)
+                  set -- "$@" \
+                    --config "profile.release.opt-level=3" \
+                    --config "profile.release.codegen-units=8" \
+                    --config "profile.release.lto=\"thin\""
+                  ;;
+                s)
+                  set -- "$@" \
+                    --config "profile.release.opt-level=\"s\"" \
+                    --config "profile.release.codegen-units=8" \
+                    --config "profile.release.lto=\"thin\""
+                  ;;
+                1)
+                  set -- "$@" \
+                    --config "profile.release.opt-level=1" \
+                    --config "profile.release.codegen-units=16" \
+                    --config "profile.release.lto=false"
+                  ;;
+                0)
+                  set -- "$@" \
+                    --config "profile.release.opt-level=1" \
+                    --config "profile.release.codegen-units=16" \
+                    --config "profile.release.lto=false" \
+                    --config "profile.release.package.agent2api-server.opt-level=0" \
+                    --config "profile.release.package.agent2api-server.codegen-units=64"
+                  ;;
+                *)
+                  echo "Unsupported SERVER_OPT_LEVEL: $SERVER_OPT_LEVEL" >&2
+                  exit 1
+                  ;;
+              esac
               t0=$(date +%s)
               cargo build "$@"
               t1=$(date +%s)

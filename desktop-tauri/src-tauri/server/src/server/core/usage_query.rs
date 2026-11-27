@@ -88,12 +88,26 @@ pub fn resolve_batch_targets(
     provider: Option<&str>,
     id: Option<&str>,
 ) -> Result<(Vec<Value>, usize), TargetError> {
-    let snapshot = store.list_accounts();
+    let snapshot = store.routing_snapshot_fresh();
+    if let Some(id) = id.filter(|value| !value.is_empty()) {
+        let Some(found) = snapshot.public_by_id.get(id) else {
+            return Err(TargetError { message: "账号不存在".to_string(), status_code: 404 });
+        };
+        return Ok((vec![(**found).clone()], 0));
+    }
     let accounts: Vec<Value> = snapshot
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .public_accounts
+        .iter()
+        .map(|account| (**account).clone())
+        .collect();
+    resolve_batch_targets_from_values(&accounts, provider, None)
+}
+
+fn resolve_batch_targets_from_values(
+    accounts: &[Value],
+    provider: Option<&str>,
+    id: Option<&str>,
+) -> Result<(Vec<Value>, usize), TargetError> {
     // provider 缺失的账号按默认 provider 归属（与 store 的兜底口径一致：
     // 旧记录没有这个字段），否则它们会在两种过滤下都被漏掉
     let in_scope = |account: &Value| match provider {
@@ -123,9 +137,9 @@ pub fn resolve_batch_targets(
     // 目标集合 = 范围内全部**可用**账号（不看 enabled，见函数头）；
     // skipped 记的是范围内不可用的数量，供界面说清「为什么少了几行」
     let (mut targets, mut skipped) = (Vec::new(), 0usize);
-    for account in accounts.into_iter().filter(in_scope) {
-        if is_available(&account) {
-            targets.push(account);
+    for account in accounts.iter().filter(|account| in_scope(account)) {
+        if is_available(account) {
+            targets.push(account.clone());
         } else {
             skipped += 1;
         }
@@ -411,12 +425,12 @@ async fn sweep_due(store: &AccountStore) {
     let now = logging::now_ms();
     // 全量账号快照（不看启用 / 可用）：Token 事实表要覆盖所有配了规则的账号，
     // 包括禁用的 —— 用户重新启用时读数已经在，不用等下一轮刷新才生效
-    let all_accounts: Vec<Value> = store
-        .list_accounts()
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let snapshot = store.routing_snapshot_fresh();
+    let all_accounts: Vec<Value> = snapshot
+        .public_accounts
+        .iter()
+        .map(|account| (**account).clone())
+        .collect();
     limiter::refresh(&all_accounts);
     limiter::enforce_disable(store, &all_accounts);
     let kinds = limiter::enabled_token_kinds(&all_accounts);
@@ -424,8 +438,8 @@ async fn sweep_due(store: &AccountStore) {
         limiter::refresh_token_facts(&kinds);
         enforce_token_disable(store, &all_accounts, now);
     }
-    let records = usage_records::load_all();
-    let mut due: Vec<(i64, Value)> = match resolve_batch_targets(store, None, None) {
+    let records = usage_records::cached_snapshot();
+    let mut due: Vec<(i64, Value)> = match resolve_batch_targets_from_values(&all_accounts, None, None) {
         Ok((targets, _skipped)) => targets,
         Err(_) => return, // 目标集合解析失败（库不可用等）：这一轮什么都不做
     }
@@ -439,7 +453,7 @@ async fn sweep_due(store: &AccountStore) {
         let interval = usage_records::query_interval_of(&account)?;
         let id = account.get("id").and_then(Value::as_str)?;
         if recovery::waiting_for_change(store, id) { return None; }
-        let rec = records.get(id);
+        let rec = records.get(id).map(std::sync::Arc::as_ref);
         let last_attempt_at = rec.map(|r| r.last_attempt_at).unwrap_or(0);
         let effective_interval = if rec.is_some_and(is_persistent_usage_error) {
             interval.max(1800)
@@ -485,18 +499,12 @@ async fn sweep_due(store: &AccountStore) {
 /// 访客没有积分体系（见 `supports_usage` 的说明），其历史失败记录也不返回。
 pub fn snapshot(store: &AccountStore) -> Value {
     let queries = jobs::states(store);
-    let records = usage_records::load_all();
-    let accounts = store.list_accounts();
-    let list = accounts.get("accounts").and_then(Value::as_array);
+    let records = usage_records::cached_snapshot();
+    let snap = store.routing_snapshot_fresh();
     let mut rows = Vec::new();
     let mut at = 0i64;
-    for (id, record) in &records {
-        let account = list.and_then(|list| {
-            list.iter().find(|account| {
-                account.get("id").and_then(Value::as_str) == Some(id.as_str())
-            })
-        });
-        let Some(account) = account else { continue };
+    for (id, record) in records.iter() {
+        let Some(account) = snap.public_by_id.get(id) else { continue };
         if is_guest(account) {
             continue;
         }
@@ -534,7 +542,9 @@ pub fn snapshot(store: &AccountStore) -> Value {
     let now = logging::now_ms();
     let facts = limiter::token_facts();
     let mut token_usage = serde_json::Map::new();
-    for account in list.into_iter().flatten() {
+    let mut all_accounts = Vec::with_capacity(snap.public_accounts.len());
+    for account in &snap.public_accounts {
+        all_accounts.push((**account).clone());
         let entries = limiter::token_usage_rows(account, &facts, now);
         if entries.is_empty() {
             continue;
@@ -543,23 +553,24 @@ pub fn snapshot(store: &AccountStore) -> Value {
             token_usage.insert(id.to_string(), Value::Array(entries));
         }
     }
-    if let Some(accounts) = list { limiter::counter::refresh(accounts); }
+    limiter::counter::refresh(&all_accounts);
     let source_facts = limiter::sources::facts();
     let counts = limiter::counter::facts();
     let mut limiter_states = serde_json::Map::new();
     let mut quota_sources = serde_json::Map::new();
     let mut limiter_models = serde_json::Map::new();
-    for account in list.into_iter().flatten() {
+    for account in &all_accounts {
         let Some(id) = account.get("id").and_then(Value::as_str) else { continue };
         let provider = crate::server::core::routing::provider_of(account);
         quota_sources.insert(id.to_string(), limiter::sources::rows_for(account, &source_facts));
         limiter_states.insert(id.to_string(), limiter::types::json_of(&limiter::evaluate::states(account, &source_facts, &counts, now)));
         limiter_models.entry(provider.to_string()).or_insert_with(|| Value::Array(limiter::sources::account_models(provider)));
     }
-    let visible_accounts: Vec<Value> = list.into_iter().flatten()
+    let visible_accounts: Vec<Value> = all_accounts
+        .into_iter()
         .filter(|account| crate::server::core::account_store::store_view::account_visible(
             crate::server::core::routing::provider_of(account),
-        )).cloned().collect();
+        )).collect();
     json!({
         "at": at,
         "queries": queries,

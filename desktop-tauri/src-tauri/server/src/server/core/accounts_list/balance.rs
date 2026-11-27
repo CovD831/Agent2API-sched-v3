@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -8,7 +9,7 @@ fn number(value: &Value) -> Option<f64> {
     value.as_f64().or_else(|| value.as_str()?.parse().ok()).filter(|number| number.is_finite())
 }
 
-pub(super) fn summary<'a>(members: impl Iterator<Item = &'a Value>, records: &HashMap<String, UsageRecord>, filtered: bool, now: i64, offset: i32) -> Value {
+pub(super) fn summary<'a>(members: impl Iterator<Item = &'a Value>, records: &HashMap<String, Arc<UsageRecord>>, filtered: bool, now: i64, offset: i32) -> Value {
     let mut total = 0;
     let mut counted = 0;
     let mut failed = 0;

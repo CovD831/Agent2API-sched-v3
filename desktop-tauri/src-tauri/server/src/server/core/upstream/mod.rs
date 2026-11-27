@@ -68,7 +68,7 @@ pub(crate) mod replay_guard;
 pub(crate) mod retry_after;
 mod rotate;
 mod route_state;
-mod route_context;
+pub(crate) mod route_context;
 mod conversation_ids;
 mod route_sticky;
 pub mod sse;
@@ -442,18 +442,28 @@ impl UpstreamService {
         }
         let resumed_vision = if images.is_none() { vision_compat::resume(&mut request)? } else { None };
         let route_model = request.body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+        let prompt_model = route_model.clone();
         let route_store = self.store.clone();
-        let route_body = request.body.clone();
+        let route_group_id = request.body.get("_wb_route_group_id").and_then(Value::as_str).map(str::to_string);
         let route_scope = request.allowed_providers.clone();
         let ignore_route = request.ignore_model_gate;
+        let route_body = (!ignore_route && crate::server::config::routing_profiles().group_for_model(&route_model).is_some())
+            .then(|| request.body.clone());
         let vision = if resumed_vision.is_none() && images.is_none() && !request.ignore_model_gate {
             vision_compat::RequestVision::capture(&request.body)?
         } else { None };
         let route_vision = vision.clone();
         let routing = if let Some(resumed) = &resumed_vision { resumed.routing.clone() } else {
             crate::server::core::blocking::run(move || {
-                route_context::RequestRouting::capture_request_with_vision(&route_model, &route_store, &route_body, route_scope.as_ref(), ignore_route,
-                    route_vision.as_ref().map(|vision| &vision.settings))
+                route_context::RequestRouting::capture_request_with_group_id(
+                    &route_model,
+                    &route_store,
+                    route_group_id.as_deref(),
+                    route_body.as_ref(),
+                    route_scope.as_ref(),
+                    ignore_route,
+                    route_vision.as_ref().map(|vision| &vision.settings),
+                )
             }).await??
         };
         let mut slot = self.begin_slot(&request.dedupe_key, cancel.as_ref()).await;
@@ -463,7 +473,7 @@ impl UpstreamService {
         // 于是「连接数」与去重槽位共享同一条生命周期，不会有第二条释放路径。
         let mut connections = ConnectionGuard::new(self.connections.clone());
         // 对话统一向上游请求流式；Images 保留独立的请求形态。
-        let mut upstream_body = request.body.clone();
+        let mut upstream_body = request.body;
         let compact_route = super::compact_routing::take_route(&mut upstream_body);
         // 标题路由的痕迹同样在发送前摘掉；它与压缩互斥（一条请求最多命中一层）。
         let title_route = super::title_routing::take_route(&mut upstream_body);
@@ -517,7 +527,7 @@ impl UpstreamService {
             );
             crate::server::core::prompt::rules::Request {
                 client: if evidence.client_id.is_empty() { "other".into() } else { evidence.client_id },
-                model: request.body.get("model").and_then(Value::as_str).unwrap_or("").into(),
+                model: prompt_model,
             }
         });
         let prompt = config.prompt_plan().with_request(&prompt_request);
