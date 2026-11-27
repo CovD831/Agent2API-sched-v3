@@ -433,6 +433,25 @@ impl RequestStats {
         }
     }
 
+    /// 使用 WAL 只读连接池执行纯读操作，不持有 `self.inner` 与写连接锁。
+    fn with_read_conn<T>(
+        &self,
+        action: impl FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Option<T> {
+        let db = self.db.as_ref()?;
+        match db.with_read(action) {
+            Some(Ok(value)) => Some(value),
+            Some(Err(error)) => {
+                eprintln!("[Stats] 统计数据库只读操作失败: {error}");
+                None
+            }
+            None => {
+                eprintln!("[Stats] 统计数据库不可用（连接已标记中毒）");
+                None
+            }
+        }
+    }
+
     /// 与 [`RequestStats::with_conn`] 同理，但给 `&mut Connection` ——
     /// **需要事务的操作用它**：记账、请求清理与保留期裁剪。
     fn with_conn_mut<T>(
@@ -496,10 +515,7 @@ impl RequestStats {
         if id.is_empty() {
             return None;
         }
-        let loaded = {
-            let guard = self.guard();
-            self.with_conn(&guard, |conn| sql::select_raw(conn, id))
-        }?;
+        let loaded = self.with_read_conn(|conn| sql::select_raw(conn, id))?;
         let Some((raw_id, request_body, response_body, truncated)) = loaded else {
             return None;
         };
@@ -544,19 +560,32 @@ impl RequestStats {
     ) -> Value {
         let now = clock::now_ms();
         let windows: Vec<i64> = CACHE_WINDOWS.iter().map(|(_, ms)| *ms).collect();
-        let loaded = {
-            let guard = self.guard();
-            self.with_conn_mut(&guard, |conn| {
-                self.flush_daily_in_conn(conn)?;
-                let daily = daily::select_daily_map(conn)?;
-                // 四档命中率在 SQL 侧聚合（一次索引扫描出四组合计）
-                let cache_totals = sql::sum_cache_windows(conn, now, &windows)?;
-                // 报表侧排除模型测试（见 `select_summary_rows` 的说明）：
-                // 趋势图与排行回答的是「真实流量长什么样」
-                let entries = sql::select_summary_rows(conn, now - SUMMARY_WINDOW_MS, now)?;
-                Ok((daily, cache_totals, entries))
-            })
-        };
+        let (mut epoch_before, mut dirty_days) = self.snapshot_dirty_daily();
+        let loaded = self.with_read_conn(|conn| {
+            let mut daily = daily::select_daily_map(conn)?;
+            if self.daily_buffer_epoch() != epoch_before {
+                let (next_epoch, next_dirty) = self.snapshot_dirty_daily();
+                epoch_before = next_epoch;
+                dirty_days = next_dirty;
+                daily = daily::select_daily_map(conn)?;
+            }
+            if self.daily_buffer_epoch() == epoch_before {
+                for dirty in &dirty_days {
+                    match daily.get(&dirty.date) {
+                        Some(existing) if existing.requests >= dirty.requests => {}
+                        _ => {
+                            daily.insert(dirty.date.clone(), dirty.clone());
+                        }
+                    }
+                }
+            }
+            // 四档命中率在 SQL 侧聚合（一次索引扫描出四组合计）
+            let cache_totals = sql::sum_cache_windows(conn, now, &windows)?;
+            // 报表侧排除模型测试（见 `select_summary_rows` 的说明）：
+            // 趋势图与排行回答的是「真实流量长什么样」
+            let entries = sql::select_summary_rows(conn, now - SUMMARY_WINDOW_MS, now)?;
+            Ok((daily, cache_totals, entries))
+        });
         let (daily, cache_totals, entries) = loaded.unwrap_or_default();
         let mut summary = summarize(&daily, &cache_totals, &entries, range, now, custom);
         let start = summary["startDate"].as_str().unwrap_or("");
@@ -579,10 +608,17 @@ impl RequestStats {
 
     pub fn today_request_count(&self) -> Value {
         let date = date_key(today());
-        let guard = self.guard();
-        let requests = self.with_conn_mut(&guard, |conn| {
-            self.flush_daily_in_conn(conn)?;
-            daily::request_count(conn, &date)
+        let (epoch_before, dirty_days) = self.snapshot_dirty_daily();
+        let requests = self.with_read_conn(|conn| {
+            let mut count = daily::request_count(conn, &date)?;
+            if self.daily_buffer_epoch() == epoch_before {
+                if let Some(dirty) = dirty_days.iter().find(|d| d.date == date) {
+                    if dirty.requests > count {
+                        count = dirty.requests;
+                    }
+                }
+            }
+            Ok(count)
         }).unwrap_or(0);
         json!({ "range": "today", "startDate": date, "endDate": date, "overview": { "requests": requests } })
     }
@@ -613,26 +649,23 @@ impl RequestStats {
             Full(Vec<RequestEntry>),
             List(Vec<record::RequestListRow>),
         }
-        let loaded = {
-            let guard = self.guard();
-            self.with_conn_mut(&guard, |conn| {
-                let tx = conn.transaction()?;
-                let page_rows = if filter.list_only {
-                    PageRows::List(sql::select_page_list_desc(&tx, &plan, filter.offset, limit)?)
-                } else {
-                    PageRows::Full(sql::select_page_desc(&tx, &plan, filter.offset, limit)?)
-                };
-                let external = tx.pragma_query_value(None, "data_version", |row| row.get(0))?;
-                let version = counts::Version {
-                    requests: self.db.as_ref().map_or(0, Db::request_revision),
-                    database: crate::server::db::query_cache_generation(),
-                    external,
-                };
-                let (total, matched, running) = self.counts.read(&tx, version, &plan)?;
-                tx.commit()?;
-                Ok((total, matched, running, page_rows))
-            })
-        };
+        let loaded = self.with_read_conn(|conn| {
+            let tx = conn.transaction()?;
+            let page_rows = if filter.list_only {
+                PageRows::List(sql::select_page_list_desc(&tx, &plan, filter.offset, limit)?)
+            } else {
+                PageRows::Full(sql::select_page_desc(&tx, &plan, filter.offset, limit)?)
+            };
+            let external = tx.pragma_query_value(None, "data_version", |row| row.get(0))?;
+            let version = counts::Version {
+                requests: self.db.as_ref().map_or(0, Db::request_revision),
+                database: crate::server::db::query_cache_generation(),
+                external,
+            };
+            let (total, matched, running) = self.counts.read(&tx, version, &plan)?;
+            tx.commit()?;
+            Ok((total, matched, running, page_rows))
+        });
         let (total, matched, running, page_rows) = loaded.unwrap_or((0, 0, 0, PageRows::Full(Vec::new())));
         let rows: Vec<Value> = match page_rows {
             PageRows::List(entries) => entries.iter().map(list_entry_json).collect(),
@@ -648,16 +681,13 @@ impl RequestStats {
 
     /// 按 `rowId` 或 `id` (+ 可选 `ts`) 读取单条请求的完整详情（含选路快照 / 尝试明细 / 敏感词 / 识别证据）。
     pub fn request_detail(&self, row_id: Option<i64>, id: Option<&str>, ts: Option<i64>) -> Option<Value> {
-        let loaded = {
-            let guard = self.guard();
-            self.with_conn(&guard, |conn| match row_id.filter(|value| *value > 0) {
-                Some(row_id) => sql::select_detail_by_row_id(conn, row_id),
-                None => match id.map(str::trim).filter(|value| !value.is_empty()) {
-                    Some(id) => sql::select_detail_by_id(conn, id, ts),
-                    None => Ok(None),
-                },
-            })
-        }?;
+        let loaded = self.with_read_conn(|conn| match row_id.filter(|value| *value > 0) {
+            Some(row_id) => sql::select_detail_by_row_id(conn, row_id),
+            None => match id.map(str::trim).filter(|value| !value.is_empty()) {
+                Some(id) => sql::select_detail_by_id(conn, id, ts),
+                None => Ok(None),
+            },
+        })?;
         let (row_id, entry) = loaded?;
         let mut value = entry_json(&entry);
         if let Some(object) = value.as_object_mut() {
@@ -674,13 +704,7 @@ impl RequestStats {
         if let Some(cached) = self.filters_cache.read_fast(database, requests) {
             return cached;
         }
-        let guard = self.guard();
-        let database = crate::server::db::query_cache_generation();
-        let requests = self.db.as_ref().map_or(0, Db::request_revision);
-        if let Some(cached) = self.filters_cache.read_fast(database, requests) {
-            return cached;
-        }
-        let loaded = self.with_conn(&guard, |conn| {
+        let loaded = self.with_read_conn(|conn| {
             self.filters_cache.read_or_compute(conn, database, requests, MAX_FILTER_OPTIONS, |conn| {
                 let (models, providers) = sql::select_filter_options(conn, MAX_FILTER_OPTIONS)?;
                 let mut sources = sql::source_filter_options(conn, MAX_FILTER_OPTIONS)?;
@@ -750,19 +774,23 @@ impl RequestStats {
     /// 而 `storage_api` 会同时给出 `available: false`，界面据此显示「—」
     /// 而不是一排看着正常的 0（0 与「真的没有数据」在数字上无法区分）。
     pub fn stats(&self) -> Value {
-        let loaded = {
-            let guard = self.guard();
-            self.with_conn_mut(&guard, |conn| {
-                self.flush_daily_in_conn(conn)?;
-                let total = sql::count_all(conn)?;
-                let days = daily::count_daily(conn)?;
-                let first = sql::min_ts(conn)?;
-                let last = sql::max_ts(conn)?;
-                let downstream_raw = sql::count_raw(conn)?;
-                let upstream_raw = sql::count_upstream_raw(conn)?;
-                Ok((total, days, first, last, downstream_raw, upstream_raw))
-            })
-        };
+        let (epoch_before, dirty_days) = self.snapshot_dirty_daily();
+        let loaded = self.with_read_conn(|conn| {
+            let total = sql::count_all(conn)?;
+            let mut days = daily::count_daily(conn)?;
+            if self.daily_buffer_epoch() == epoch_before {
+                for dirty in &dirty_days {
+                    if !daily::has_daily_date(conn, &dirty.date)? {
+                        days += 1;
+                    }
+                }
+            }
+            let first = sql::min_ts(conn)?;
+            let last = sql::max_ts(conn)?;
+            let downstream_raw = sql::count_raw(conn)?;
+            let upstream_raw = sql::count_upstream_raw(conn)?;
+            Ok((total, days, first, last, downstream_raw, upstream_raw))
+        });
         let (total, daily_days, first_ts, last_ts, downstream_raw, upstream_raw) =
             loaded.unwrap_or((0, 0, None, None, 0, 0));
         let file = self.file().to_string_lossy().to_string();
@@ -809,6 +837,9 @@ impl RequestStats {
         let guard = self.guard();
         let _ = self.with_conn_mut(&guard, |conn| {
             self.flush_daily_in_conn(conn)?;
+            if let Some(db) = self.db.as_ref() {
+                db.clear_read_pool();
+            }
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
             Ok(())
         });

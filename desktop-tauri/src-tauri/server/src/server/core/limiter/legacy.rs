@@ -610,7 +610,7 @@ pub fn refresh_token_facts(kinds: &[i64]) {
         let start = kind_window_start(kind, now);
         // 闭包返回 Vec（库不可用 / 语句失败给空表 —— 上层按「没消耗」降级，
         // 与余额事实的库不可用口径一致）；持锁期间不打日志。
-        let rows = db.with(|conn| {
+        let rows = db.with_read(|conn| {
             let Ok(mut statement) = conn.prepare(
                 "SELECT account_id, COALESCE(SUM(total_tokens), 0) FROM requests \
                  WHERE account_id != '' AND ts >= ?1 GROUP BY account_id",

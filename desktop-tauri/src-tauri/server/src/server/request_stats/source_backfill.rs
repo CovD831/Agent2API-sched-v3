@@ -111,8 +111,9 @@ pub(super) fn backfill_sources(conn: &Connection) -> rusqlite::Result<()> {
     let mut rebuilt: BTreeMap<String, RecoveredDay> = BTreeMap::new();
     {
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM requests WHERE is_test = 0 AND status <> 0 ORDER BY ts, row_id",
-            sql::REQUEST_COLUMNS,
+            "SELECT {} FROM {} WHERE r.is_test = 0 AND r.status <> 0 ORDER BY r.ts, r.row_id",
+            sql::REQUEST_JOIN_COLUMNS,
+            sql::REQUEST_DETAILS_JOIN,
         ))?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {

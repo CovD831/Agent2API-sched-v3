@@ -136,3 +136,70 @@ fn duplicate_request_is_counted_once_and_negative_tokens_are_clamped() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn prune_expired_deletes_old_rolling_events_but_protects_total_window_accounts() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::server::db::schema::migrate(&conn).unwrap();
+
+    let now = 2_000_000_000_000i64;
+    let old_ts = now - 40 * 86_400_000;
+    let recent_ts = now - 5 * 86_400_000;
+
+    insert_event(&conn, "acc-rolling", "old-r", "m", "", 100, old_ts).unwrap();
+    insert_event(&conn, "acc-rolling", "new-r", "m", "", 200, recent_ts).unwrap();
+    insert_event(&conn, "acc-total", "old-t", "m", "", 300, old_ts).unwrap();
+
+    let accounts = vec![
+        serde_json::json!({
+            "id": "acc-rolling",
+            "limiterGroups": [{
+                "enabled": true,
+                "conditions": [{
+                    "metric": "tokens",
+                    "comparison": "gte",
+                    "threshold": 1000,
+                    "window": { "reset": "rolling", "seconds": 86400 }
+                }]
+            }]
+        }),
+        serde_json::json!({
+            "id": "acc-total",
+            "limiterGroups": [{
+                "enabled": true,
+                "conditions": [{
+                    "metric": "tokens",
+                    "comparison": "gte",
+                    "threshold": 1000,
+                    "window": { "reset": "total", "startsAt": 0, "endsAt": 0 }
+                }]
+            }]
+        }),
+    ];
+
+    let eqp: String = conn
+        .query_row(
+            "EXPLAIN QUERY PLAN SELECT row_id FROM account_limiter_events WHERE ts < ?1 ORDER BY ts ASC LIMIT 100",
+            params![now - 35 * 86_400_000],
+            |row| row.get(3),
+        )
+        .unwrap();
+    assert!(
+        eqp.contains("idx_limiter_events_ts"),
+        "expected idx_limiter_events_ts in EQP: {eqp}"
+    );
+
+    let deleted = prune_expired_in_conn(&conn, &accounts, now, 100).unwrap();
+    assert_eq!(deleted, 1);
+
+    let remaining: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM account_limiter_events ORDER BY row_id")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(remaining, vec!["new-r".to_string(), "old-t".to_string()]);
+}

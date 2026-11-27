@@ -69,7 +69,7 @@ impl RequestStats {
 
     pub fn clear_preview(&self, filter: &RequestQuery) -> Option<Value> {
         let plan = sql::FilterPlan::of(filter);
-        let (all, raw) = self.with_conn(&self.guard(), |conn| {
+        let (all, raw) = self.with_read_conn(|conn| {
             let all = sql::count_matching(conn, &plan)?;
             let raw = sql::count_raw_matching(conn, &plan)?;
             Ok((all, raw))
@@ -142,11 +142,13 @@ impl RequestStats {
         std::thread::spawn(move || {
             let outcome = db.with(|conn| -> rusqlite::Result<()> {
                 db.invalidate_accounts();
+                db.clear_read_pool();
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
                 conn.execute_batch("VACUUM;")?;
                 // 尾部 checkpoint：把 VACUUM 写进 WAL 的那份整库并回主库并截零。
                 // 少了它，回收的空间只从主库搬到 `-wal`，总占用不降反升（#297）。
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                db.clear_read_pool();
                 db.invalidate_accounts();
                 Ok(())
             });

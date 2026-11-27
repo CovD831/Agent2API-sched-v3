@@ -100,6 +100,14 @@ pub(super) fn request_count(conn: &Connection, date: &str) -> rusqlite::Result<i
         .optional().map(|count| count.unwrap_or(0))
 }
 
+pub(super) fn has_daily_date(conn: &Connection, date: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM request_daily WHERE date = ?1)",
+        [date],
+        |row| row.get(0),
+    )
+}
+
 /// 整行写入（存在即覆盖）。
 ///
 /// `date` 是主键，所以「同一天重复记账」天然是覆盖而不是插入两行 ——
@@ -167,6 +175,7 @@ pub(super) struct DailyBuffer {
     pub dirty_dates: std::collections::BTreeSet<String>,
     pub dirty_ops: usize,
     pub last_flush_ms: i64,
+    pub epoch: u64,
 }
 
 impl super::RequestStats {
@@ -234,16 +243,32 @@ impl super::RequestStats {
         Ok(())
     }
 
+    pub(super) fn daily_buffer_epoch(&self) -> u64 {
+        self.daily_buffer.lock().unwrap_or_else(|e| e.into_inner()).epoch
+    }
+
+    pub(super) fn snapshot_dirty_daily(&self) -> (u64, Vec<DailyEntry>) {
+        let buf = self.daily_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let dirty = buf
+            .dirty_dates
+            .iter()
+            .filter_map(|date| buf.days.get(date).cloned())
+            .collect();
+        (buf.epoch, dirty)
+    }
+
     pub(super) fn clear_daily_buffer(&self) {
         let mut buf = self.daily_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.days.clear();
         buf.dirty_dates.clear();
         buf.dirty_ops = 0;
+        buf.epoch = buf.epoch.wrapping_add(1);
     }
 
     pub(super) fn evict_daily_buffer_before(&self, cutoff_key: &str) {
         let mut buf = self.daily_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.days.retain(|k, _| k.as_str() >= cutoff_key);
         buf.dirty_dates.retain(|k| k.as_str() >= cutoff_key);
+        buf.epoch = buf.epoch.wrapping_add(1);
     }
 }

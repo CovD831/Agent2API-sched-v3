@@ -88,6 +88,7 @@ pub(super) fn import(
     // 槽payload不参与密钥重加密：原样保留但永远属于旧epoch，不按ID解密或建立Ready。
     let safety = db.with_account_change(|change| change.restore(&temp.conn, |main| {
         db.invalidate_accounts();
+        db.clear_read_pool();
         let safety = safety::create(main, config_dir)?;
         set_phase(RestorePhase::Replacing);
         if let Err(error) = replace(&temp.conn, main) {
@@ -96,12 +97,14 @@ pub(super) fn import(
                 .map_err(|error| format!("打开安全备份失败: {error}"))
                 .and_then(|old| replace(&old, main));
             db.invalidate_accounts();
+            db.clear_read_pool();
             return match rollback {
                 Ok(()) => Err(format!("{error}；已自动还原替换前的业务数据，本机密钥未更换；旧换证资格仍保持隔离")),
                 Err(rollback_error) => Err(format!("{error}；自动还原失败: {rollback_error}。安全备份保存在 {}，本机密钥未更换", safety.display())),
             };
         }
         db.invalidate_accounts();
+        db.clear_read_pool();
         Ok(safety)
     })).ok_or("数据库连接不可用，恢复未执行")??;
     db.invalidate_accounts();

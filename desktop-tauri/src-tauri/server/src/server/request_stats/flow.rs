@@ -16,11 +16,16 @@ use super::{entry_json, sql, RequestStats};
 const BASE: &str = "WITH flow AS (
     SELECT row_id, id, ts,
       CASE WHEN client IN ('assistant', 'assistant_images', 'assistant_title') THEN 'assistant' ELSE client END AS client,
-      provider, account_id, account_name, status, error, attempts, route,
-      CASE WHEN json_valid(client_evidence) THEN COALESCE(json_extract(client_evidence, '$.clientName'), '') ELSE '' END AS client_name,
+      provider, account_id, account_name, status, error, attempts,
+      CASE WHEN (detail_flags & 32) <> 0 THEN ((detail_flags & 16) <> 0)
+           WHEN json_valid(route) THEN json_extract(route, '$.stickyHit') = 1 ELSE 0 END AS sticky_hit,
+      CASE WHEN (detail_flags & 32) <> 0 THEN recorded_client_name
+           WHEN json_valid(client_evidence) THEN COALESCE(json_extract(client_evidence, '$.clientName'), '') ELSE '' END AS client_name,
       COALESCE(NULLIF(client_model, ''), model, '') AS request_model,
-      CASE WHEN json_valid(route) THEN COALESCE(json_extract(route, '$.sessionId'), json_extract(route, '$.stickyId'), '') ELSE '' END AS session_id,
-      CASE WHEN json_valid(route) THEN COALESCE(json_extract(route, '$.sessionSource'), '') ELSE '' END AS session_source,
+      CASE WHEN (detail_flags & 32) <> 0 THEN session_id
+           WHEN json_valid(route) THEN COALESCE(json_extract(route, '$.sessionId'), json_extract(route, '$.stickyId'), '') ELSE '' END AS session_id,
+      CASE WHEN (detail_flags & 32) <> 0 THEN session_source
+           WHEN json_valid(route) THEN COALESCE(json_extract(route, '$.sessionSource'), '') ELSE '' END AS session_source,
       (status = 0 AND error IS NULL) AS running,
       CASE WHEN status = 0 AND error IS NULL THEN ?1 ELSE ts + MAX(duration_ms, 0) END AS last_seen
     FROM requests
@@ -54,7 +59,12 @@ pub struct FlowQuery {
 }
 
 fn value_at(conn: &Connection, row_id: i64) -> rusqlite::Result<Value> {
-    conn.query_row(&format!("SELECT {}, row_id AS trace_key FROM requests WHERE row_id = ?1", sql::REQUEST_COLUMNS),
+    conn.query_row(
+        &format!(
+            "SELECT {}, r.row_id AS trace_key FROM {} WHERE r.row_id = ?1",
+            sql::REQUEST_JOIN_COLUMNS,
+            sql::REQUEST_DETAILS_JOIN,
+        ),
         params![row_id], |row| {
             let mut value = entry_json(&sql::decode_request(row)?);
             value["traceKey"] = row_id.to_string().into();
@@ -66,9 +76,7 @@ impl RequestStats {
     pub fn routing_flow(&self, query: &FlowQuery, detail: Option<&str>) -> Value {
         let now = crate::server::logging::now_ms();
         let since = now.saturating_sub(query.minutes * 60_000);
-        let loaded = {
-            let guard = self.guard();
-            self.with_conn(&guard, |conn| {
+        let loaded = self.with_read_conn(|conn| {
                 let parameters = params![now, since, query.model, query.running_only, query.search, query.path,
                     query.session, crate::server::logging::process_started_at(), query.client.is_some(), query.client.as_deref().unwrap_or(""), query.provider, query.account, query.session_search];
                 if detail == Some("requests") {
@@ -124,7 +132,7 @@ impl RequestStats {
                 let mut statement = conn.prepare(&format!("{BASE} SELECT json_array({group}), client, request_model, provider, account_id,
                     MAX(account_name), COUNT(*), SUM(running), SUM(status >= 200 AND status < 300 AND error IS NULL),
                     SUM((status <> 0 OR error IS NOT NULL) AND (status < 200 OR status >= 300 OR error IS NOT NULL)), COUNT(DISTINCT NULLIF(session_id, '')),
-                    SUM(CASE WHEN json_valid(route) THEN json_extract(route, '$.stickyHit') = 1 ELSE 0 END), SUM(attempts > 1), MAX(last_seen), MAX(client_name)
+                    SUM(sticky_hit), SUM(attempts > 1), MAX(last_seen), MAX(client_name)
                     FROM selected GROUP BY {group} ORDER BY SUM(running) DESC, COUNT(*) DESC, MAX(last_seen) DESC LIMIT 300"))?;
                 let paths = statement.query_map(parameters, |row| Ok(json!({
                     "id": row.get::<_, String>(0)?, "client": row.get::<_, String>(1)?, "model": row.get::<_, String>(2)?,
@@ -136,8 +144,7 @@ impl RequestStats {
                 })))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(json!({ "available": true, "paths": paths, "pathCount": matched, "truncated": matched > 300,
                     "requests": requests, "running": running, "sessions": sessions, "unknownRequests": unknown, "now": now, "since": since }))
-            })
-        };
+        });
         let mut result = loaded.unwrap_or_else(|| json!({ "available": false, "paths": [], "entries": [], "matched": 0, "now": now }));
         if let Some(paths) = result["paths"].as_array_mut() {
             for path in paths {
