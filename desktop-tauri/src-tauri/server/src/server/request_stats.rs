@@ -1,0 +1,882 @@
+//! 请求统计存储：`requests` 表（明细）+ `request_daily` 表（按天聚合）+
+//! `request_raw` 表（完整下游正文，预览对话的地基）。
+//!
+//! ── 内部分层（拆开是为了每片都保持单一职责、单文件不过长）─────
+//! ```text
+//! server/
+//!   request_stats.rs     存储句柄、查询与读取
+//!   request_stats/
+//!     writer.rs   请求开始、在途回写、终态与限额记账
+//!     sql.rs      行级 SQL：明细的读写删裁 + 跨表共用的 FilterPlan（原始 SQL 唯一
+//!                 出现的地方之一；另一处是 daily.rs 与杂项子模块各自的语句）
+//!     daily.rs    行级 SQL：`request_daily` 聚合表的编解码与读-改-写
+//!     record.rs   数据类型与 JSON 契约（RequestEntry / DailyEntry / Retention…）
+//!     report.rs   报表计算：纯函数（区间、补零、命中率、topModel、连续天数）
+//!     aggregate.rs 聚合计算：日报折算（fold_into_daily）/ 整行重算 / 报表装配
+//!     maintenance.rs 维护动作：两模式清理 / 清理预览 / 数据库压缩（VACUUM）
+//!     clock.rs    本地时区工具（chrono::Local 在整模块的唯一使用点）
+//!     backfill.rs 旧聚合行的口径回填（**只由迁移项调用**，见那边的说明）
+//!     legacy.rs   旧文件导入的入口：解析旧 JSONL、算迁移期边界、写库+裁剪
+//!                 （同样只由迁移项调用，运行期一次都不会走到）
+//! ```
+//!
+//! ── 读侧接口的接线状态 ──────────────────────────────────────
+//! 读侧（`usage_summary` / `query_requests` / `prune` / `stats` / 清理与压缩）
+//! 已由 `api::stats_api` 的路由接上，这些接口上的 `#[allow(dead_code)]`
+//! 已全部移除：新增的公开接口若没人调用会直接报 warning，便于及时发现漏接的路由。
+//! 仍保留 allow 的只有 `file()` 系访问器与 `import_legacy_*`
+//! （理由写在各自的注释里）。
+//!
+//! ── 为什么是两张表（原来的「两个文件」）──────────────────────
+//! 这个取舍**一字未变**，只是载体从文件换成了表：
+//!   - `requests`：请求明细，一行一条。短窗口指标（缓存命中率的 10 分钟 / 1 小时
+//!     窗口、近 24 小时趋势）必须逐条算，按天的聚合行给不出这种精度。
+//!   - `request_daily`：按天聚合，一行一天。热力图固定 365 天、`all` 区间可能跨年，
+//!     都超出报表侧读明细的窗口（`SUMMARY_WINDOW_MS`，改造后只剩 24 小时 ——
+//!     命中率四档已在 SQL 侧聚合，不再要求把窗口内的明细读回来），所以这份
+//!     **寿命独立于明细**：明细被手动清理后当天的聚合行仍在，历史曲线不会出现空洞。
+//! `request_raw` 保存完整下游正文，独立成表的理由（大字段不进列表查询）见
+//! `db/schema.rs` 的 V3_SCHEMA。
+//! 两个文件变两张表还顺带解决了原来的两个麻烦：**明细与聚合的一致性**（原来是
+//! 两次独立写盘，中间崩溃会留下「明细删了、聚合还在」的错位）现在由**一个事务**
+//! 保证；正文随明细的**同步清理**（淘汰 / 清空时先删正文再删明细）见
+//! `maintenance.rs` 模块头的约定。
+//!
+//! ── 落盘策略：全部消失 ──────────────────────────────────────
+//! 改造前明细是「追加写为主 + 攒够 `COMPACT_STEP` 次才整文件重写」，聚合是
+//! 「变更满 50 次或距上次落盘超 60 秒才重写整个文件」（延迟落盘）。进数据库后
+//! 这两套机制整体消失：
+//!   - 明细一条 `INSERT`，聚合一行 UPSERT，**每次记账都立即提交**（`record` 里
+//!     一个事务做完两件事），没有「内存比文件多」的对齐问题，也没有整文件重写；
+//!   - 于是 `dirty` / `appends_since_compact` / `COMPACT_STEP` / `insert_sorted` /
+//!     延迟落盘的那对计数器与时钟全部不再存在；
+//!   - 退出路径的 `flush()` 因此不再是「补写未落盘的内容」——它的新职责见该方法。
+//!
+//! ── 并发模型 ────────────────────────────────────────────────
+//! 所有公开方法取 `&self`，真正的串行化由 `Db` 那把 Mutex 负责：每个公开方法都在
+//! **一次** `Db::with` / `with_mut` 调用里跑完（多语句操作用事务包住），所以两次
+//! 并发记账不可能交错。本结构里那把 `inner` 锁是第二道闸，作用与取舍见
+//! [`RequestStats::guard`]。
+//! 锁中毒时的取向与 T2/T3 一致：`Db` 中毒返回 `None`（连接状态可能停在事务中间，
+//! 不能拿半截数据当真相），`inner` 那把则 `into_inner()` 接管（它保护的是空标记）。
+
+mod backfill;
+mod clock;
+// 旧文件导入的入口（只给 `db::migrate` 的迁移项调用，运行期不参与）。
+// `pub(crate)` 而不是私有：迁移项在 `db::migrate` 里，与 `request_stats`
+// 不是父子模块，私有模块它够不到。
+pub(crate) mod legacy;
+// 聚合计算（日报折算 / 重算 / 报表装配）与维护动作（两模式清理 / 预览 /
+// 数据库压缩）：各自的拆分理由见两个子模块的模块头。
+mod aggregate;
+mod daily;
+mod maintenance;
+mod record;
+// 报表计算层（纯函数）与「模型请求日志」的查询实现。
+//
+// 这里**不放模块级 allow**：本层已由 `api::stats_api` 的报表路由接线，
+// 于是「新增了一个算好却没人用的函数」会直接报 warning —— 那正是我们想知道的。
+// 模块内部各函数仍应是 `pub(super)`：只有 `request_stats.rs` 能调到它们，
+// 对外暴露面收敛在这一层。
+mod report;
+mod cache_report;
+mod counts;
+mod filters_cache;
+mod model_recency;
+mod routing;
+mod trace;
+mod flow;
+pub use flow::FlowQuery;
+mod retention;
+mod source;
+mod source_report;
+mod source_backfill;
+mod lifecycle;
+mod writer;
+pub(crate) use writer::LimiterEvent;
+mod sql;
+#[cfg(test)]
+mod tests;
+
+pub use source::{ApiKeyIdentity, RequestSource};
+pub fn request_date_bounds(start: NaiveDate, end: NaiveDate) -> Option<(i64, i64)> {
+    let next = end.succ_opt()?;
+    Some((clock::local_midnight_ms(start), clock::local_midnight_ms(next)))
+}
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+
+use chrono::NaiveDate;
+use serde_json::{json, Value};
+
+use crate::server::db::Db;
+use crate::server::logging;
+
+use clock::{date_key, now_ms, today};
+use retention::RetentionBounds;
+pub use retention::Retention;
+// 拆到子模块的三样，这里引回：record / usage_summary 的折算入口、
+// remap 的库操作体、报表装配（均为 `pub(super)`，见 aggregate.rs 的模块头）
+use aggregate::{fold_into_daily, remap_model_days, summarize};
+use report::{entry_json, list_entry_json, provider_label, CACHE_WINDOWS};
+
+// CompactStart 在此 re-export：api::stats_api 的 compact 路由按它分派响应。
+// VacuumStatus 只在本模块内（字段类型 / maintenance 的方法）可见。
+use maintenance::VacuumStatus;
+pub use maintenance::CompactStart;
+pub use record::{
+    AttemptDetail, NewRequestEntry, RequestEntry, RequestQuery, RetryEvent,
+    RunningProgress, SensitiveHit, DEFAULT_LIMIT, MAX_LIMIT, MAX_RAW_ROWS,
+};
+
+/// 报表的**明细窗口**：从明细读行时按它下界，不必把整张明细表读回内存。
+///
+/// 改造后只剩**近 24 小时趋势**一件事需要逐条明细（四档命中率已由
+/// `sql::sum_cache_windows` 在 SQL 侧聚合完），所以窗口从 7 天收到 1 天 ——
+/// 这是「读回来的行数」这一项的直接来源（实测库上 26,763 → 5,975 行）。
+///
+/// 与窗口大小无关的两件事：命中率四档里最长的 `last7d` 仍按 7 天算（它在 SQL
+/// 侧的 `WHERE ts >= ?` 里自带下界），`request_daily` 聚合表的读取也不受它影响
+/// （热力图与 `all` 档本来就跨年）。
+const SUMMARY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// 筛选下拉的候选上限（模型名与 provider id 各一份）。
+///
+/// 200 是个「够用且不失控」的数：真实使用的模型名通常在几十个量级，而这份清单
+/// 按出现次数降序，尾部那些只出现一两次的值本来也没人会用下拉去选。
+/// 截断的只是**候选**，不影响筛选能力 —— 前端会把当前选中的值保留在列表里
+/// （见 `ui/requests-panel.js` 的 `fillFilterSelect`）。
+const MAX_FILTER_OPTIONS: usize = 200;
+
+/// 「进行中」行的陈旧阈值：status=0 且开始时刻距今超过 1 小时视为僵尸行。
+///
+/// 为什么是 1 小时：进行中行由收尾记账（`record` 的 UPDATE）消除；正常请求
+/// 从转发开始到收尾最多几分钟（上游超时 + 重试链的全长），1 小时还停在
+/// status=0 的行只剩两种成因 —— 网关进程崩溃（桌面端常驻数周，崩溃行会
+/// 一直留着）与响应流任务泄漏。它们没有任何终态值（token 全 0、无状态码），
+/// 留在列表里只会伪装成「一条永远在跑的请求」，所以到点清掉。清理时机挂在
+/// `record_started` 上（每次有新请求开始时顺手扫一遍），不需要定时器。
+const RUNNING_STALE_MS: i64 = 60 * 60 * 1000;
+
+/// 记账热路径上的保留期 / 容量裁剪节拍。
+///
+/// 原先**每条请求**（开始 + 收尾各一次）都要 `COUNT(*)` 整张明细表来判断
+/// 是否超过条数上限，再顺带数一次 `request_raw` —— 每条请求两轮全表计数，
+/// 明细上百万行时这部分会明显吃掉转发收尾的时间。改成每 128 次记账或每
+/// 60 秒做一次：上限最多被突破 127 行，下一次裁剪抹平；低流量时按时间兜底，
+/// 不会出现「没有新请求就永远不清理」。
+const MAINTENANCE_EVERY: u64 = 128;
+const MAINTENANCE_INTERVAL_MS: i64 = 60_000;
+
+/// 进程重启后遗留的进行中行按 `ts` 判定：早于本次启动时刻的全是孤儿。
+/// 以进程启动时间做阈值而不是固定时长，能覆盖长请求在重启时仍在途的场景。
+fn stale_cutoff() -> i64 {
+    std::cmp::max(now_ms() - RUNNING_STALE_MS, crate::server::logging::process_started_at())
+}
+
+/// 环境变量名：关掉「启动孤儿清扫」（只该由 channel-flip 的**过渡容器**设置）。
+pub const ENV_SKIP_ORPHAN_SWEEP: &str = "AGENT2API_SKIP_ORPHAN_SWEEP";
+
+/// 解析该开关。「环境变量什么算真」是经典出错点（`"0"` / `"false"` / 空白都不该算开）。
+fn parse_skip_flag(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("") => false,
+        Some(text) => !(text == "0" || text.eq_ignore_ascii_case("false")),
+    }
+}
+
+/// 是否跳过「孤儿清扫」（默认**不跳过** = 行为与改造前逐字相同）。
+///
+/// 清扫把 `status = 0 且 ts < 本进程启动时刻` 的行判成孤儿、补 408 终态。判据在
+/// **单进程**下恒成立；但 channel-flip 让过渡容器与旧容器**共享同一份 SQLite**，
+/// 于是过渡容器一启动就把旧容器正在服务的在途行标成 408，旧容器收尾时
+/// `WHERE id = ?1 AND status = 0` 已不匹配 ⇒ 行永久停在 408、token 被清空。
+/// 实测：2026-11-04 那次 54 行、11-03 那次约 53 行，同一模式。
+/// 只给**过渡容器**设这个变量：正式容器在旧容器停掉之后才起，那时判定是合法的崩溃恢复。
+/// 宽限窗口：开了开关之后，只有**启动后这段时间内**才跳过清扫。
+///
+/// ── 为什么不是「整个生命周期都跳过」（2026-11-04 生产实测）────────
+/// channel-flip 的交接里有**两个**容器会在对方仍在服务时启动：
+///   ① 过渡容器（新旧同库，旧容器还在 3065 上跑）；
+///   ② 正式容器（`recreate.sh` 起在 3065，而**过渡容器此刻正在 3066 上服务**）。
+/// 上一次切换只给 ① 设了开关，② 启动时的启动清扫仍把过渡容器的在途行标成 408：
+/// 16 行的 `ts + duration_ms` 全部等于正式容器启动时刻(+1.5s) —— 与 11-03/11-04
+/// 那两次同一模式，量级从 ~54 降到 16。
+///
+/// 反过来，把开关做成「永久跳过」会让真正的崩溃恢复永久失灵（幽灵"进行中"行
+/// 再也不会被清理）。宽限窗口同时满足两者：交接是**分钟级**的，落在窗口内；
+/// 窗口过后照常清扫，而那时过渡容器早已删除、在途行也早已终态。
+const ORPHAN_SWEEP_GRACE_MS: i64 = 10 * 60 * 1000;
+
+/// 判据单独拆出来是为了可测：整条规则就是「now - 启动时刻 < 宽限」。
+fn within_orphan_grace(started_at: i64, now: i64) -> bool {
+    now.saturating_sub(started_at) < ORPHAN_SWEEP_GRACE_MS
+}
+
+fn orphan_sweep_disabled() -> bool {
+    static FLAGGED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let flagged = *FLAGGED
+        .get_or_init(|| parse_skip_flag(std::env::var(ENV_SKIP_ORPHAN_SWEEP).ok().as_deref()));
+    flagged && within_orphan_grace(crate::server::logging::process_started_at(), now_ms())
+}
+
+#[cfg(test)]
+mod orphan_sweep_flag_tests {
+    use super::{parse_skip_flag, ENV_SKIP_ORPHAN_SWEEP};
+
+    /// 变量名是 channel-flip 脚本与网关之间的契约，改它必须同时改脚本。
+    #[test]
+    fn env_var_name_is_the_agreed_contract() {
+        assert_eq!(ENV_SKIP_ORPHAN_SWEEP, "AGENT2API_SKIP_ORPHAN_SWEEP");
+    }
+
+    /// 宽限窗口的边界：交接（分钟级）在内，崩溃恢复（更久之后）在外。
+    ///
+    /// 这条判据的存在理由见 `ORPHAN_SWEEP_GRACE_MS` 的模块注释：开关如果
+    /// 「永久生效」，真正的崩溃恢复就再也不会发生。
+    #[test]
+    fn grace_window_covers_the_handover_but_not_forever() {
+        use super::{within_orphan_grace, ORPHAN_SWEEP_GRACE_MS};
+        let t0 = 1_000_000_i64;
+        assert!(within_orphan_grace(t0, t0), "刚启动必须在窗口内");
+        assert!(within_orphan_grace(t0, t0 + 120_000), "2 分钟（交接实测时长）必须在窗口内");
+        assert!(within_orphan_grace(t0, t0 + ORPHAN_SWEEP_GRACE_MS - 1), "窗口内最后一毫秒");
+        assert!(!within_orphan_grace(t0, t0 + ORPHAN_SWEEP_GRACE_MS), "窗口边界外必须恢复清扫");
+        assert!(!within_orphan_grace(t0, t0 + 86_400_000), "跑一天之后必须恢复清扫");
+        // 时钟回拨（NTP 校正）不能让窗口变成永久：饱和减到 0，仍算「刚启动」。
+        assert!(within_orphan_grace(t0, t0 - 5_000), "回拨时按「刚启动」处理，而不是跳过到永久");
+    }
+
+    /// 未设置 / 空白 / "0" / "false" 都算**不跳过**（保持崩溃恢复）。
+    #[test]
+    fn only_explicit_truthy_values_skip_the_sweep() {
+        for raw in [None, Some(""), Some("   "), Some("0"), Some("false"), Some("FALSE")] {
+            assert!(!parse_skip_flag(raw), "{raw:?} 不该算作跳过");
+        }
+        for raw in [Some("1"), Some("true"), Some("TRUE"), Some("yes"), Some(" 1 ")] {
+            assert!(parse_skip_flag(raw), "{raw:?} 应算作跳过");
+        }
+    }
+}
+
+
+/// 请求统计存储本体。所有公开方法取 `&self`，内部一把 `Mutex` 串行化调用序列。
+pub struct RequestStats {
+    /// SQLite 句柄。`None` = 数据库打开失败（启动时已记日志）。
+    ///
+    /// ── 为什么不做「文件回退」─────────────────────────────────
+    /// 与 `LogStore` / `AccountStore` 的选择一致（见那两处的说明），在请求统计上
+    /// 还多一条：这里的写入发生在**每个请求的收尾路径**上（`api::chat` 的记账点），
+    /// 回退实现会变成一条高频执行、却只在数据库坏掉时才第一次运行的分支 ——
+    /// 那是最坏的一类「没人测过的代码」。而统计的可接受降级很明确：
+    /// **少记一条不影响任何业务**（报表少一个数）。所以库不可用时按各方法各自的
+    /// 合理空值回落（见每个方法的说明），不写第二个文件。
+    db: Option<Db>,
+    /// 库文件路径（`stats()` 的 `file` / `dailyFile` 与排障用）。
+    ///
+    /// 语义从「明细文件 / 聚合文件」变成「装着这两份数据的库文件」—— 与
+    /// `LogStore::file()` / `AccountStore::file()` 的处理一致。库打不开时回落到
+    /// 约定路径（`{config_dir}/agent2api.db`）：这个值会显示在报表页与设置页的
+    /// 存储概况里（`api::storage_api` 读它），给一个有意义的位置比给空串更有用。
+    ///
+    /// 为什么是 `RwLock` 而不是裸字段：与 `LogStore::file_path` 同一处理 ——
+    /// 字段本身不再被任何写路径改动（`relocate` 已随单库语义删除），用 `RwLock`
+    /// 是为了让「读现值」这件事与改造前同形，改动面最小。
+    file_path: RwLock<PathBuf>,
+    /// 保留期取值回调。**每次裁剪时动态调用**，于是设置改完天数下一次记账 /
+    /// `prune` 就用新值，不需要重启进程（这正是把保留期做成回调而非构造参数的原因）。
+    /// 用 `Arc` 是因为 `RequestStats` 本身被放进 `ServerState`，回调要能独立持有。
+    /// 回调每次裁剪时被调用，应读**内存快照**（如 `config::retention_settings()`），
+    /// 不要每次读盘 —— 记账是每个请求都要走一次的路径。
+    get_retention: Arc<dyn Fn() -> Retention + Send + Sync>,
+    /// 让「一次公开调用」的多个步骤不被另一次公开调用插进来。
+    ///
+    /// ── 它现在到底保证什么（诚实版）─────────────────────────────
+    /// 数据一致性**不靠它**：真正把语句串起来的是 `Db` 内部那把 Mutex + SQLite
+    /// 事务（每个写方法都在一个事务里跑完，读方法各是一次 `Db::with`）。
+    /// 它串行化公开方法的调用序列；数据一致性仍由数据库连接锁与事务保证。
+    /// 保留它与账号、事件日志两个 store 的并发形状一致。
+    /// **硬约束**：持这把锁期间绝不能再调 `logging::log` 一类的写日志函数 ——
+    /// 日志要写同一个库，`std::sync::Mutex` 不可重入，会当场死锁。
+    inner: Mutex<()>,
+    /// 数据库压缩（VACUUM）的运行状态。`Arc` 是因为完成回调在**另一个线程**
+    /// 里执行，它要能独立更新这份状态（`RequestStats` 本体不必被线程持有）。
+    ///
+    /// 为什么不做成模块级 `static`：`RequestStats` 本来就是进程级单例
+    /// （`ServerState` 里那一份 `Arc`），状态挂在实例上让「有多个实例的测试」
+    /// 各自独立；OmniProxy 用模块级 let 变量是因为它的 router 是文件级单例，
+    /// 两边语义等价，这里选与本项目结构一致的挂法。
+    vacuum: Arc<VacuumStatus>,
+    /// 自上次保留期裁剪以来记了多少次账（开始 + 收尾各算一次）。
+    maintenance_writes: AtomicU64,
+    /// 上次做保留期裁剪的毫秒时间戳；低流量时用它兜底。
+    last_maintenance_ms: AtomicI64,
+    model_recency: Arc<model_recency::ModelRecency>,
+    counts: counts::CountsCache,
+    filters_cache: filters_cache::FilterOptionsCache,
+    /// 按天聚合行的内存写合并缓冲：消除每笔请求都反序列化/重写数千账号 JSON 大字段造成的 WAL 暴涨。
+    daily_buffer: Mutex<daily::DailyBuffer>,
+}
+
+impl RequestStats {
+    /// 构造存储句柄（库不可用时降级为空操作，见 `db` 字段的说明）。
+    ///
+    /// ── 签名为什么从 `new(directory, ...)` 改成接 `Db` ──────────
+    /// 统计不再有「自己的目录」：数据在统一库的两张表里，路径这件事由 `Db`
+    /// 唯一持有（`Db::file()`）。与 `AccountStore::with_db` /
+    /// `LogStore::with_db` 同一形态，三个 store 的构造方式保持一致；
+    /// `Option<Db>` 也一致（库打不开时仍能构造，只是降级）。
+    ///
+    /// ── 为什么不再有 `load()` ──────────────────────────────────
+    /// 改造前构造时要读两个文件、按保留期各裁一遍、再对旧聚合行做一次口径回填
+    /// （`backfill`）。现在库就是全集，没有可载入的东西：
+    ///   - 「启动时裁一次超期行」由 `record` / `prune` 天然承担（它们每次都带上边界）；
+    ///   - 「旧聚合行缺账号维度」只可能出现在**从旧文件迁上来的那批数据**里
+    ///     （新代码写出的行三个维度恒齐），所以那次回填搬进了迁移项
+    ///     （`import_legacy_daily`），运行期不再需要；
+    ///   - 那条 `[Stats] 已载入请求统计 N 条明细` 的控制台输出随之取消 ——
+    ///     它对应的「载入了多少」这个事实已经不成立。
+    ///
+    /// 回调每次裁剪时被调用，应读**内存快照**（如 `config::retention_settings()`），
+    /// 不要每次读盘 —— 记账是每个请求都要走一次的路径。
+    pub fn with_db(
+        db: Option<Db>,
+        get_retention: impl Fn() -> Retention + Send + Sync + 'static,
+    ) -> Self {
+        let file_path = match db.as_ref() {
+            Some(db) => db.file().to_path_buf(),
+            None => crate::server::config::config_dir().join(crate::server::db::FILE_NAME),
+        };
+        Self {
+            db,
+            file_path: RwLock::new(file_path),
+            get_retention: Arc::new(get_retention),
+            inner: Mutex::new(()),
+            vacuum: Arc::new(VacuumStatus::new()),
+            maintenance_writes: AtomicU64::new(0),
+            last_maintenance_ms: AtomicI64::new(0),
+            model_recency: Arc::new(model_recency::ModelRecency::default()),
+            counts: counts::CountsCache::default(),
+            filters_cache: filters_cache::FilterOptionsCache::new(),
+            daily_buffer: Mutex::new(daily::DailyBuffer::default()),
+        }
+    }
+
+    /// 取锁；中毒（某次持锁 panic）时接管继续用 —— 与 `LogStore::guard` /
+    /// `AccountStore::guard` 同一取向：这把锁保护的是「调用序列」而不是数据本身，
+    /// 锁内没有会被 panic 打断的中间态（真正的数据一致性由数据库事务保证）。
+    fn guard(&self) -> MutexGuard<'_, ()> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// 这一次记账要不要顺带做保留期 / 容量裁剪。
+    ///
+    /// 计数与时间都取原子读，不必进数据库锁；返回值只影响「是否多跑几条
+    /// DELETE/COUNT」，并发下偶尔多跑一次没有副作用。
+    fn should_maintain(&self) -> bool {
+        let writes = self.maintenance_writes.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = now_ms();
+        let last = self.last_maintenance_ms.load(Ordering::Relaxed);
+        if writes == 1
+            || writes % MAINTENANCE_EVERY == 0
+            || now.saturating_sub(last) >= MAINTENANCE_INTERVAL_MS
+        {
+            self.last_maintenance_ms.store(now, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 库文件路径（`stats()` 的 `file` / `dailyFile` 与排障用）。
+    ///
+    /// 为什么是 `RwLock` 而不是裸字段：与 `LogStore::file_path` 同一处理 ——
+    /// 字段本身不再被任何写路径改动（`relocate` 与两个 `*_file()` 访问器已随
+    /// 单库语义删除），用 `RwLock` 是为了让「读现值」这件事与改造前同形，
+    /// 改动面最小。
+    fn file(&self) -> PathBuf {
+        match self.file_path.read() {
+            Ok(guard) => guard.clone(),
+            // 中毒恢复：路径是纯数据，继续用内部值
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// 在已取锁的前提下执行一次数据库读操作。
+    ///
+    /// `None` = 库不可用（未打开 / 连接中毒）或 SQL 失败，由调用方决定降级值
+    /// （各方法的说明里写了为什么是那个值）。
+    ///
+    /// 失败只打**控制台**：绝不能走 `logging::log` —— 日志要写同一个库，
+    /// `std::sync::Mutex` 不可重入，会当场死锁。
+    fn with_conn<T>(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        action: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Option<T> {
+        let db = self.db.as_ref()?;
+        match db.with(action) {
+            Some(Ok(value)) => Some(value),
+            Some(Err(error)) => {
+                eprintln!("[Stats] 统计数据库操作失败: {error}");
+                None
+            }
+            None => {
+                eprintln!("[Stats] 统计数据库不可用（连接已标记中毒）");
+                None
+            }
+        }
+    }
+
+    /// 与 [`RequestStats::with_conn`] 同理，但给 `&mut Connection` ——
+    /// **需要事务的操作用它**：记账、请求清理与保留期裁剪。
+    fn with_conn_mut<T>(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        action: impl FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Option<T> {
+        let db = self.db.as_ref()?;
+        match db.with_mut(action) {
+            Some(Ok(value)) => Some(value),
+            Some(Err(error)) => {
+                eprintln!("[Stats] 统计数据库操作失败: {error}");
+                None
+            }
+            None => {
+                eprintln!("[Stats] 统计数据库不可用（连接已标记中毒）");
+                None
+            }
+        }
+    }
+
+    /// 当前保留期（每次调用都取回调的实时值并归一化）
+    fn retention(&self) -> Retention {
+        (self.get_retention)().normalized()
+    }
+
+    /// 保留期的两条边界（明细用毫秒下界，聚合用日期键下界）。
+    ///
+    /// 两者都从「本地今天」往前推，且**每次调用都重算**（回调动态取），
+    /// 于是设置里改完天数，下一次记账/裁剪就生效，不需要重启进程。
+    fn retention_bounds(&self) -> RetentionBounds {
+        RetentionBounds::of(self.retention())
+    }
+
+    /// 仅调试模式开启时保存完整下游正文，读写与明细查询分离。
+    /// 按留存条数淘汰旧正文，保存失败不影响请求记账。
+    pub fn store_raw(&self, id: &str, ts: i64, request_body: Option<&str>, response_body: Option<&str>) {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let request = request_body.unwrap_or("");
+        let response = response_body.unwrap_or("");
+        // 两侧全空不值得占一行：表的约定是「有行 ⇔ 有正文」
+        if request.is_empty() && response.is_empty() {
+            return;
+        }
+        // 完整正文的落库字节数。
+        let size = (request.len() + response.len()) as i64;
+        let guard = self.guard();
+        let _ = self.with_conn_mut(&guard, |conn| {
+            let tx = conn.transaction()?;
+            sql::upsert_raw(&tx, id, ts, request, response, size)?;
+            tx.commit()
+        });
+    }
+
+    /// 按 id 读取完整下游正文；历史截断标记由数据库列保留。
+    pub fn raw_body(&self, id: &str) -> Option<Value> {
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let loaded = {
+            let guard = self.guard();
+            self.with_conn(&guard, |conn| sql::select_raw(conn, id))
+        }?;
+        let Some((raw_id, request_body, response_body, truncated)) = loaded else {
+            return None;
+        };
+        Some(json!({
+            "id": raw_id,
+            "requestBody": request_body,
+            "responseBody": response_body,
+            "truncated": truncated,
+        }))
+    }
+
+    /// 报表聚合。数据来自两张表，计算是 `report` 的纯函数。
+    ///
+    /// `range` 的非法值一律按 `"7"` 处理，并在结果里回显归一化后的值：
+    /// 报表是只读展示，为一次拼错的参数让整页报错，不如给个合理默认
+    /// （前端也不用为这个场景做错误态）。路由层（`api::stats_api::stats_summary`）
+    /// 另外对非法值给 400 —— 那是用户在选择器上显式选的值，静默换区间会
+    /// 让页面显示的数据与选项对不上；两层各管一件事，这里保留兜底。
+    ///
+    /// ── 读取窗口 ────────────────────────────────────────────────
+    /// 聚合整表读（一年最多 365 行）；命中率四档**不下读明细**（由 SQL 侧按窗口
+    /// 聚合出四组合计，见 `sql::sum_cache_windows`）；明细只取**近 24 小时**的
+    /// 窄列（`sql::select_summary_rows`，只服务逐小时趋势）。窗口外的条目在
+    /// 纯函数里本来就会被逐条判掉，不必先读回内存。
+    /// `now` 在这里取**一次**并同时用于查询上界与两个纯函数的窗口判定：
+    /// 取两次的话，两次之间到达的条目可能落在「查出来了但不在窗口内」（无害）
+    /// 或「在窗口内但没查出来」（少算）这两种边界上，而前者只是白读、后者是错。
+    ///
+    /// 降级：库不可用时**按空库算同一份结果**（不是另写一套空值 JSON）——
+    /// 前端读到的形状与「这段时间没有数据」完全一致，所以它拿到的是
+    /// 「暂无数据」的空态，而不是 undefined 造成的渲染异常
+    /// （`ui/report.js` 的 `overviewHtml` / `paintRank` 都按 `Number(x) || 0`
+    /// 与 `Array.isArray` 消费，空态文案是「所选范围内还没有请求记录」）。
+    ///
+    /// `custom` 只在 `range == "custom"` 时有意义（起止本地自然日，路由层已
+    /// 解析校验）；其余档位传 None，区间由 `range_bounds` 现算。
+    pub fn usage_summary(
+        &self,
+        range: &str,
+        custom: Option<(NaiveDate, NaiveDate)>,
+        api_key: Option<&str>,
+    ) -> Value {
+        let now = clock::now_ms();
+        let windows: Vec<i64> = CACHE_WINDOWS.iter().map(|(_, ms)| *ms).collect();
+        let loaded = {
+            let guard = self.guard();
+            self.with_conn_mut(&guard, |conn| {
+                self.flush_daily_in_conn(conn)?;
+                let daily = daily::select_daily_map(conn)?;
+                // 四档命中率在 SQL 侧聚合（一次索引扫描出四组合计）
+                let cache_totals = sql::sum_cache_windows(conn, now, &windows)?;
+                // 报表侧排除模型测试（见 `select_summary_rows` 的说明）：
+                // 趋势图与排行回答的是「真实流量长什么样」
+                let entries = sql::select_summary_rows(conn, now - SUMMARY_WINDOW_MS, now)?;
+                Ok((daily, cache_totals, entries))
+            })
+        };
+        let (daily, cache_totals, entries) = loaded.unwrap_or_default();
+        let mut summary = summarize(&daily, &cache_totals, &entries, range, now, custom);
+        let start = summary["startDate"].as_str().unwrap_or("");
+        let end = summary["endDate"].as_str().unwrap_or("");
+        let mut sources = source_report::source_summary(&daily, start, end, api_key);
+        let keys = crate::server::core::api_keys::list();
+        if let Some(rows) = sources["apiKeys"].as_array_mut() {
+            for row in rows {
+                if row["source"] != "key" { continue; }
+                let entry = keys.iter().find(|key| Some(key.id.as_str()) == row["id"].as_str());
+                row["state"] = json!(match entry { Some(key) if key.enabled => "enabled", Some(_) => "disabled", None => "deleted" });
+                if let Some(key) = entry { row["label"] = json!(key.name); }
+            }
+        }
+        if let (Some(target), Some(sources)) = (summary.as_object_mut(), sources.as_object()) {
+            target.extend(sources.clone());
+        }
+        summary
+    }
+
+    pub fn today_request_count(&self) -> Value {
+        let date = date_key(today());
+        let guard = self.guard();
+        let requests = self.with_conn_mut(&guard, |conn| {
+            self.flush_daily_in_conn(conn)?;
+            daily::request_count(conn, &date)
+        }).unwrap_or(0);
+        json!({ "range": "today", "startDate": date, "endDate": date, "overview": { "requests": requests } })
+    }
+
+    /// 明细查询：倒序（新在前）分页。
+    ///
+    /// 顺序由 SQL 的 `ORDER BY ts DESC, row_id DESC` 保证 —— 与旧的「内存恒按 ts
+    /// 升序，倒序 == 反向遍历」逐位一致，也不会出现「长请求晚收尾导致记录顺序
+    /// 飘忽」的翻页错乱（同 ts 的次序由 `row_id` 定死）。
+    ///
+    /// 过滤条件与清理接口**共用同一份** `sql::FilterPlan`（见那里的说明）：
+    /// 「页面上筛出来的 N 条」与「清空删掉的那批」必然是同一个集合。
+    ///
+    /// 响应里的 `running` 是**同一筛选条件下**仍处进行中（status=0）的条数：
+    /// 列表页徽标用它显示「还有几条没跑完」，一条 COUNT 得出，不拉明细。
+    ///
+    /// 降级：库不可用时给 `{entries: [], total: 0, matched: 0, running: 0}` ——
+    /// 前端 `ui/requests-panel.js` 对这个形状的读法是 `Number(result?.total) || 0`
+    /// 与 `Array.isArray(result?.entries)`，空表会显示「暂无请求日志」（`emptyText`），
+    /// 不会崩也不会误报有内容。**注意它不会把读数清成 0 而不作声**：
+    /// 读取**失败**（HTTP 错误）走的是另一条路（`render('读取请求日志失败…')`
+    /// 与徽标退成「—」），而这里返回的是「成功但为空」——两者的区别在前端是有意的。
+    pub fn query_requests(&self, filter: &RequestQuery) -> Value {
+        // limit 夹在 [1, MAX_LIMIT]：前端传 0 或十万都不该让接口躺平
+        let limit = filter.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        let plan = sql::FilterPlan::of(filter);
+        enum PageRows {
+            Full(Vec<RequestEntry>),
+            List(Vec<record::RequestListRow>),
+        }
+        let loaded = {
+            let guard = self.guard();
+            self.with_conn_mut(&guard, |conn| {
+                let tx = conn.transaction()?;
+                let page_rows = if filter.list_only {
+                    PageRows::List(sql::select_page_list_desc(&tx, &plan, filter.offset, limit)?)
+                } else {
+                    PageRows::Full(sql::select_page_desc(&tx, &plan, filter.offset, limit)?)
+                };
+                let external = tx.pragma_query_value(None, "data_version", |row| row.get(0))?;
+                let version = counts::Version {
+                    requests: self.db.as_ref().map_or(0, Db::request_revision),
+                    database: crate::server::db::query_cache_generation(),
+                    external,
+                };
+                let (total, matched, running) = self.counts.read(&tx, version, &plan)?;
+                tx.commit()?;
+                Ok((total, matched, running, page_rows))
+            })
+        };
+        let (total, matched, running, page_rows) = loaded.unwrap_or((0, 0, 0, PageRows::Full(Vec::new())));
+        let rows: Vec<Value> = match page_rows {
+            PageRows::List(entries) => entries.iter().map(list_entry_json).collect(),
+            PageRows::Full(entries) => entries.iter().map(entry_json).collect(),
+        };
+        json!({
+            "entries": rows,
+            "total": total,
+            "matched": matched,
+            "running": running,
+        })
+    }
+
+    /// 按 `rowId` 或 `id` (+ 可选 `ts`) 读取单条请求的完整详情（含选路快照 / 尝试明细 / 敏感词 / 识别证据）。
+    pub fn request_detail(&self, row_id: Option<i64>, id: Option<&str>, ts: Option<i64>) -> Option<Value> {
+        let loaded = {
+            let guard = self.guard();
+            self.with_conn(&guard, |conn| match row_id.filter(|value| *value > 0) {
+                Some(row_id) => sql::select_detail_by_row_id(conn, row_id),
+                None => match id.map(str::trim).filter(|value| !value.is_empty()) {
+                    Some(id) => sql::select_detail_by_id(conn, id, ts),
+                    None => Ok(None),
+                },
+            })
+        }?;
+        let (row_id, entry) = loaded?;
+        let mut value = entry_json(&entry);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("rowId".to_string(), json!(row_id));
+            object.insert("detailsLoaded".to_string(), Value::Bool(true));
+        }
+        Some(value)
+    }
+
+    /// 筛选下拉的候选清单：明细里出现过的模型名与 provider（各按出现次数降序）。
+    pub fn filter_options(&self) -> Value {
+        let database = crate::server::db::query_cache_generation();
+        let requests = self.db.as_ref().map_or(0, Db::request_revision);
+        if let Some(cached) = self.filters_cache.read_fast(database, requests) {
+            return cached;
+        }
+        let guard = self.guard();
+        let database = crate::server::db::query_cache_generation();
+        let requests = self.db.as_ref().map_or(0, Db::request_revision);
+        if let Some(cached) = self.filters_cache.read_fast(database, requests) {
+            return cached;
+        }
+        let loaded = self.with_conn(&guard, |conn| {
+            self.filters_cache.read_or_compute(conn, database, requests, MAX_FILTER_OPTIONS, |conn| {
+                let (models, providers) = sql::select_filter_options(conn, MAX_FILTER_OPTIONS)?;
+                let mut sources = sql::source_filter_options(conn, MAX_FILTER_OPTIONS)?;
+                if let Some(clients) = sources["clients"].as_array_mut() {
+                    for client in clients {
+                        client["label"] = json!(crate::server::core::client::display_name(
+                            client["value"].as_str().unwrap_or(""),
+                            client["label"].as_str().unwrap_or(""),
+                        ));
+                    }
+                }
+                let providers: Vec<Value> = providers
+                    .into_iter()
+                    .map(|id| json!({ "id": id, "label": provider_label(&id) }))
+                    .collect();
+                Ok(json!({
+                    "models": models,
+                    "providers": providers,
+                    "clients": sources["clients"],
+                    "apiKeys": sources["apiKeys"],
+                }))
+            })
+        });
+        loaded.unwrap_or_else(|| json!({ "models": [], "providers": [], "clients": [], "apiKeys": [] }))
+    }
+
+    /// 存储概况（排障与报表页脚用）
+    ///
+    /// `file` / `dailyFile` 都指向**库文件**（不再有明细文件与聚合文件之分，
+    /// 按当前保留期裁一遍超期数据（明细 + 按天聚合）。
+    ///
+    /// 调用方是 `stats_api::put_retention`：设置页把保留天数改小后立即触发，
+    /// 否则旧数据要等下一条请求记账才消失，界面会显示「设置是 7 天，
+    /// 日志里还有 30 天前的条目」。`record` 每次记账也会带同样的边界顺手裁
+    /// （见该方法的说明），本方法是「改完设置马上见效」的那一下。
+    ///
+    /// 降级：库不可用时什么都不做 —— `prune` 的契约是「尽力清理」，
+    /// 它没有返回值可以报告失败（调用方 `stats_api` 调完就返回响应），
+    /// 而失败已经由 `with_conn_mut` 打了一行控制台。
+    pub fn prune(&self) {
+        let bounds = self.retention_bounds();
+        let guard = self.guard();
+        let ok = self.with_conn_mut(&guard, |conn| {
+            let tx = conn.transaction()?;
+            self.flush_daily_in_conn(&tx)?;
+            sql::delete_expired_requests(&tx, bounds.requests_ms)?;
+            retention::trim_requests(&tx, bounds.request_count)?;
+            daily::delete_daily_before(&tx, &bounds.daily_key)?;
+            self.evict_daily_buffer_before(&bounds.daily_key);
+            tx.commit()
+        }).is_some();
+        if ok {
+            self.filters_cache.invalidate();
+            crate::server::core::panel_events::notify_requests();
+        }
+        // 显式裁剪（启动 / 改保留期）之后重置节拍：下一次记账从新的一批开始。
+        self.maintenance_writes.store(0, Ordering::Relaxed);
+        self.last_maintenance_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// 见 `file_path` 的说明）。`firstTs` / `lastTs` 取明细 `ts` 的最小 / 最大值，
+    /// 与旧实现的「升序数组首尾元素的 ts」等价。
+    ///
+    /// 降级：库不可用时给全 0 且 `firstTs` / `lastTs` 为 `null`。
+    /// 消费方 `api::storage_api` 读的是 `total` 与 `dailyDays`（设置页的
+    /// 存储概况显示「请求记录 N 条 / 报表 N 天」）；库不可用时那两个值都是 0，
+    /// 而 `storage_api` 会同时给出 `available: false`，界面据此显示「—」
+    /// 而不是一排看着正常的 0（0 与「真的没有数据」在数字上无法区分）。
+    pub fn stats(&self) -> Value {
+        let loaded = {
+            let guard = self.guard();
+            self.with_conn_mut(&guard, |conn| {
+                self.flush_daily_in_conn(conn)?;
+                let total = sql::count_all(conn)?;
+                let days = daily::count_daily(conn)?;
+                let first = sql::min_ts(conn)?;
+                let last = sql::max_ts(conn)?;
+                let downstream_raw = sql::count_raw(conn)?;
+                let upstream_raw = sql::count_upstream_raw(conn)?;
+                Ok((total, days, first, last, downstream_raw, upstream_raw))
+            })
+        };
+        let (total, daily_days, first_ts, last_ts, downstream_raw, upstream_raw) =
+            loaded.unwrap_or((0, 0, None, None, 0, 0));
+        let file = self.file().to_string_lossy().to_string();
+        json!({
+            "total": total,
+            "dailyDays": daily_days,
+            "downstreamRaw": downstream_raw,
+            "upstreamRaw": upstream_raw,
+            "file": file,
+            // 与 file 同值：明细与聚合同居一个库。保留这个字段是为了不破坏
+            // 既有读取方（`file` 的语义已经说明它指库文件），但**不要再把两者
+            // 的字节数相加** —— 改造前前端就这么算过，而它们指向同一个文件，
+            // 结果是大小被算了两遍。设置页现在只读 `database.bytes` 一个数。
+            "dailyFile": file,
+            "firstTs": first_ts,
+            "lastTs": last_ts,
+            "today": date_key(today()),
+        })
+    }
+
+    /// 退出时收尾：把 WAL 并回主库文件并清掉 `-wal` / `-shm` 残留。
+    ///
+    /// ── 为什么不再是「补写未落盘的内容」────────────────────────
+    /// 旧实现有一套延迟落盘（聚合行变更满 50 次或距上次落盘超 60 秒才重写整个
+    /// 文件），停机路径必须显式 `flush()` 一次，否则用户刚看到的请求在下次启动后
+    /// 会少一截（`server/mod.rs` 的停机注释写的就是这件事）。进数据库后**每次
+    /// 记账都立即提交**，没有任何「内存里还没落盘」的状态，那个理由整体消失。
+    ///
+    /// ── 那为什么还要做一次 checkpoint ────────────────────────────
+    /// 注意它**不是**为了数据安全：WAL 本身是崩溃安全的（`synchronous=NORMAL`
+    /// 下掉电最多丢最近若干已提交事务，库不会损坏），已提交的数据下次打开时
+    /// 由 WAL 自动恢复。做它有两个实在的好处：
+    ///   1. 会话结束后主库文件就是全部数据 —— 用户备份、拷贝、看「占用多大」时
+    ///      只有一个文件是真相（不 checkpoint 的话数据散在 `-wal` 里，
+    ///      停机后不必再同时拷贝 WAL；运行中的存储概况统计主库与 WAL 的总占用）；
+    ///   2. 清掉 `-wal` / `-shm` 残留文件，不留一个「进程退了但盘上还有半截
+    ///      WAL」的观感。
+    /// 代价是停机时一次全量检查点（把 WAL 里的页写回主库）—— 退出路径上的一次
+    /// IO，用户感知不到（库通常在几十 MB 以内）。
+    /// `TRUNCATE` 会在检查点完整完成后把 WAL 截成 0 字节；若中途有读锁挡着
+    /// （本例只有一个连接，实际不会），SQLite 会保留 WAL 而不报错 —— 所以这里
+    /// 忽略返回值是安全的：失败只意味着「这次没收敛」，数据仍然完好。
+    pub fn flush(&self) {
+        let guard = self.guard();
+        let _ = self.with_conn_mut(&guard, |conn| {
+            self.flush_daily_in_conn(conn)?;
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            Ok(())
+        });
+    }
+
+    /// 模型维度的一次性口径订正：把「按请求名（映射别名）累计」的历史聚合行，
+    /// 用现存明细按新口径（上游真名，见 `model_stat_key`）重算。
+    ///
+    /// ── 为什么需要它 ──────────────────────────────────────────
+    /// 改口径前写出的聚合行，模型维度记的是请求侧解析名 —— 客户端点名映射
+    /// 别名时，用量被记在别名名下（同一个上游模型在环形图里拆成好几行）。
+    /// 明细里一直有 `upstreamModel`（schema v2 起就有列），所以明细覆盖到的
+    /// 天数可以真正重算，不是猜。
+    ///
+    /// ── 为什么是 kv 标记 + 启动期一次 ──────────────────────────
+    /// 与 `backfill::rebuild_legacy_days`（缺账号维度回填）不同：那次的候选
+    /// 「聚合行缺 accountStats」可以从聚合行本身检测（缺列即候选），幂等免费；
+    /// 这次的错行（模型键是别名）与对行（模型键是真名）在聚合行里**长得一样**，
+    /// 没有可检测的特征，幂等必须靠显式标记（`kv` 表，与 `legacy::MARKER_*`
+    /// 同一机制）。
+    ///
+    /// ── 拿不准就不动 ──────────────────────────────────────────
+    /// 沿用 `backfill` 的安全边界：明细可能被用户手动清理过，
+    /// 当天「明细条数 ≥ 聚合行 requests」才说明明细足以代表当天，才重算；
+    /// 不够的天原样保留 —— 用残缺明细重算会让当天数字凭空缩水，比留着别名
+    /// 分组更糟。明细已被清掉的历史天因此**不修**：那些天没有重算依据。
+    ///
+    /// ── 调用时机（与 `account_bootstrap` 同一模式）──────────────
+    /// 启动时一次（`server/mod.rs`）；待迁移旧文件还没导入时（`upgrade_pending`）
+    /// 跳过 —— 跑了会把幂等标记打早，导入完成的旧聚合行就永远轮不到订正；
+    /// 升级完成后由 `api::upgrade_api` 补调一次。两处都调不会做两遍活
+    /// （标记 + 条数判据，见上）。
+    pub fn remap_model_dimension_once(&self) {
+        // 日志不能在持 `inner` 锁期间打（会写同一个库，`Mutex` 不可重入，
+        // 见 `guard` 的说明），先把结果拿出来，锁释放后再记
+        let outcome = {
+            let guard = self.guard();
+            self.with_conn_mut(&guard, |conn| {
+                self.flush_daily_in_conn(conn)?;
+                let res = remap_model_days(conn);
+                self.clear_daily_buffer();
+                res
+            })
+        };
+        match outcome {
+            Some(changed) if !changed.is_empty() => {
+                self.filters_cache.invalidate();
+                crate::server::core::panel_events::notify_requests();
+                logging::log(
+                "[Stats]",
+                &format!(
+                    "🔁 已按上游真名重算 {} 天的模型用量（此前按请求名 / 映射别名累计）：{}",
+                    changed.len(),
+                    changed.join("、")
+                ),
+            );
+            }
+            Some(_) => {}
+            // Err（已由 with_conn_mut 打控制台日志）与库不可用都在这一支：
+            // 标记没写，下次启动自然再试，订正不会因此丢
+            None => {}
+        }
+    }
+}
+
+impl Drop for RequestStats {
+    fn drop(&mut self) {
+        let guard = self.guard();
+        let _ = self.with_conn_mut(&guard, |conn| self.flush_daily_in_conn(conn));
+    }
+}

@@ -1,0 +1,12 @@
+target/
+**/target/
+node_modules/
+**/node_modules/
+.DS_Store
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+*.key
+*.pem

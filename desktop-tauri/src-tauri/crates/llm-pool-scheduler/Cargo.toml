@@ -1,0 +1,10 @@
+[package]
+name = "llm-pool-scheduler"
+version = "0.1.0"
+description = "Production-hardened, zero-IO multi-provider account pool scheduler with 4-band quota hysteresis, TTFT rescue, wave-guarded health FSM, and primal-dual policy hooks"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
