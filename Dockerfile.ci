@@ -1,0 +1,20 @@
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=oven/bun:1.4.0 /usr/local/bin/bun /usr/local/bin/bun
+COPY agent2api-server /usr/local/bin/agent2api-server
+COPY desktop-tauri/ui /app/ui
+COPY LICENSE /app/LICENSE
+COPY licenses/ /app/licenses/
+ENV AGENT2API_HOST=0.0.0.0 \
+    AGENT2API_PROXY_HOME=/data \
+    AGENT2API_UI_DIR=/app/ui \
+    AGENT2API_CAPTCHA_ENABLED=1 \
+    AGENT2API_SELF_UPDATE=1
+VOLUME ["/data"]
+EXPOSE 3065
+WORKDIR /app
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${AGENT2API_PROXY_PORT:-3065}/health" || exit 1
+ENTRYPOINT ["/usr/local/bin/agent2api-server"]

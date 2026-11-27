@@ -1,0 +1,225 @@
+name: Build Linux Server (Bookworm x86_64)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "desktop-tauri/src-tauri/**"
+      - "desktop-tauri/ui/**"
+      - "Agent2Providers/**"
+      - "Dockerfile.ci"
+      - ".github/workflows/build-server.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image & Release tag (empty = sha-<short>)"
+        required: false
+        default: ""
+        type: string
+      server_opt_level:
+        description: "opt-level for agent2api-server crate"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
+          - "s"
+      publish_release:
+        description: "Publish GitHub Release tarball"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build-server-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute build metadata
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_OPT_LEVEL: ${{ inputs.server_opt_level }}
+          INPUT_PUBLISH_RELEASE: ${{ inputs.publish_release }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          else
+            TAG="sha-${SHA:0:7}"
+          fi
+          OPT_LEVEL="${INPUT_OPT_LEVEL:-1}"
+          IMAGE_REPO="ghcr.io/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')/agent2api-server"
+          if [ "$INPUT_PUBLISH_RELEASE" = "true" ] || [ "$REF_TYPE" = "tag" ]; then
+            PUBLISH_RELEASE="true"
+          else
+            PUBLISH_RELEASE="false"
+          fi
+          {
+            echo "tag=$TAG"
+            echo "opt_level=$OPT_LEVEL"
+            echo "image_repo=$IMAGE_REPO"
+            echo "publish_release=$PUBLISH_RELEASE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Metadata: tag=$TAG opt_level=$OPT_LEVEL image_repo=$IMAGE_REPO publish_release=$PUBLISH_RELEASE"
+
+      - name: Prepare host cache directories
+        run: |
+          mkdir -p \
+            "$HOME/.ci-cargo/registry/cache" \
+            "$HOME/.ci-cargo/registry/index" \
+            "$HOME/.ci-cargo/git/db" \
+            "$HOME/.ci-target/release"
+
+      - name: Cache Cargo & release target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ci-cargo/registry/cache
+            ~/.ci-cargo/registry/index
+            ~/.ci-cargo/git/db
+            ~/.ci-target/release
+          key: linux-amd64-bookworm-opt${{ steps.meta.outputs.opt_level }}-${{ hashFiles('desktop-tauri/src-tauri/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            linux-amd64-bookworm-opt${{ steps.meta.outputs.opt_level }}-${{ hashFiles('desktop-tauri/src-tauri/Cargo.lock') }}-
+            linux-amd64-bookworm-opt${{ steps.meta.outputs.opt_level }}-
+
+      - name: Build agent2api-server in rust:1-bookworm
+        env:
+          SERVER_OPT_LEVEL: ${{ steps.meta.outputs.opt_level }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:/build" \
+            -v "$HOME/.ci-cargo:/cargo" \
+            -v "$HOME/.ci-target:/target" \
+            -e HOME=/tmp \
+            -e CARGO_HOME=/cargo \
+            -e CARGO_TARGET_DIR=/target \
+            -e CARGO_INCREMENTAL=0 \
+            -e SERVER_OPT_LEVEL="$SERVER_OPT_LEVEL" \
+            rust:1-bookworm sh -c '
+              set -eu
+              mkdir -p /build/desktop-tauri/src-tauri/src
+              test -f /build/desktop-tauri/src-tauri/src/lib.rs || : > /build/desktop-tauri/src-tauri/src/lib.rs
+              cd /build/desktop-tauri/src-tauri
+              set -- \
+                --release --bin agent2api-server -p agent2api-server \
+                --config "profile.release.opt-level=1" \
+                --config "profile.release.codegen-units=16" \
+                --config "profile.release.lto=false" \
+                --config "profile.release.debug=0" \
+                --config "patch.\"https://github.com/ProvidersPlugin/Agent2Providers\".agent2api-provider-protocol.path=\"/build/Agent2Providers/crates/provider-protocol\""
+              if [ "$SERVER_OPT_LEVEL" = "0" ]; then
+                set -- "$@" \
+                  --config "profile.release.package.agent2api-server.opt-level=0" \
+                  --config "profile.release.package.agent2api-server.codegen-units=64"
+              elif [ "$SERVER_OPT_LEVEL" = "s" ]; then
+                set -- "$@" \
+                  --config "profile.release.package.agent2api-server.opt-level=\"s\"" \
+                  --config "profile.release.package.agent2api-server.codegen-units=8"
+              fi
+              t0=$(date +%s)
+              cargo build "$@"
+              t1=$(date +%s)
+              echo "BUILD_SECONDS=$((t1 - t0))"
+              cp /target/release/agent2api-server /build/agent2api-server
+              strip /build/agent2api-server
+              rm -rf /target/release/agent2api-server /target/release/agent2api-server.d /target/release/incremental
+              rm -rf /build/desktop-tauri/src-tauri/src
+            '
+          ls -lh agent2api-server
+
+      - name: Build Bookworm runtime image & verify ABI
+        env:
+          IMAGE_REPO: ${{ steps.meta.outputs.image_repo }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker build -f Dockerfile.ci \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            -t "${IMAGE_REPO}:${TAG}" \
+            -t "${IMAGE_REPO}:latest" \
+            .
+          docker run --rm --entrypoint sh "${IMAGE_REPO}:${TAG}" -c '
+            set -e
+            ldd /usr/local/bin/agent2api-server
+            ! ldd /usr/local/bin/agent2api-server | grep -q "not found"
+            ls -lh /usr/local/bin/agent2api-server /usr/local/bin/bun /app/ui/index.html
+          '
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        env:
+          IMAGE_REPO: ${{ steps.meta.outputs.image_repo }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE_REPO}:${TAG}"
+          docker push "${IMAGE_REPO}:latest"
+          docker inspect --format '{{json .RepoDigests}}' "${IMAGE_REPO}:${TAG}"
+
+      - name: Package tarball and checksum
+        run: |
+          set -euo pipefail
+          tar -czf agent2api-server-linux-amd64.tar.gz agent2api-server
+          sha256sum agent2api-server-linux-amd64.tar.gz > agent2api-server-linux-amd64.tar.gz.sha256
+          ls -lh agent2api-server-linux-amd64.tar.gz agent2api-server-linux-amd64.tar.gz.sha256
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent2api-server-linux-amd64-${{ steps.meta.outputs.tag }}
+          path: |
+            agent2api-server-linux-amd64.tar.gz
+            agent2api-server-linux-amd64.tar.gz.sha256
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          OPT_LEVEL: ${{ steps.meta.outputs.opt_level }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              agent2api-server-linux-amd64.tar.gz \
+              agent2api-server-linux-amd64.tar.gz.sha256 \
+              --clobber
+          else
+            gh release create "$TAG" \
+              agent2api-server-linux-amd64.tar.gz \
+              agent2api-server-linux-amd64.tar.gz.sha256 \
+              --target "$SHA" \
+              --title "$TAG" \
+              --notes "Automated Bookworm x86_64 build (opt-level=$OPT_LEVEL, commit=${SHA:0:7})"
+          fi
