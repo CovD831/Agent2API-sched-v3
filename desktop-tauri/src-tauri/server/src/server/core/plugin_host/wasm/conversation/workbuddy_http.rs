@@ -135,6 +135,10 @@ impl Context {
             let headers_deadline = ticket.binding.headers_deadline;
             let ended = ticket.binding.signal.ended.clone();
             let canceled = ticket.binding.call_cancel.clone();
+            let path_key = path.cache_key();
+            let orig_origin = url::Url::parse(&material.url)
+                .ok()
+                .map(|parsed| parsed.origin().ascii_serialization());
             let (frozen, url) = tokio::select! {
                 biased;
                 _ = ended.cancelled() => return Err(unavailable()),
@@ -149,10 +153,17 @@ impl Context {
             let Material { params, bytes, headers, url } = material;
             let expected_bytes = bytes.clone();
             // 原Download接管整个Frozen包装与实际发送；此后不以外层select丢弃原等待。
-            let result = script::open_frozen_once(&params, bytes, frozen, execution, deadline, headers_deadline, move |request| {
+            match script::open_frozen_once(&params, bytes, frozen, execution, deadline, headers_deadline, move |request| {
                 ticket.consume(request, &url, &headers, &expected_bytes)
-            }).await?;
-            Ok(Some(result))
+            }).await {
+                Ok(result) => Ok(Some(result)),
+                Err(error) => {
+                    if let Some(origin) = orig_origin.as_deref() {
+                        preflight::invalidate(&path_key, origin);
+                    }
+                    Err(error)
+                }
+            }
         }
     }
 }

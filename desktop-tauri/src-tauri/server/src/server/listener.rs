@@ -81,6 +81,7 @@ impl axum::serve::Listener for ObservedListener {
                             drop(socket);
                             return std::future::pending().await;
                         }
+                        let _ = socket.set_nodelay(true);
                         return (socket, address);
                     }
                     Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionRefused

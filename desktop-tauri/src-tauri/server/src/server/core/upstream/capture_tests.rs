@@ -88,3 +88,41 @@ async fn direct_chat_responses_still_capture_original_bytes_once() {
         assert_eq!(capture.captured_body(), CHAT);
     }
 }
+
+#[tokio::test]
+async fn first_reasoning_chunk_flushes_immediately_and_subsequent_short_chunk_flushes_within_window() {
+    let telemetry = Arc::new(usage::RequestTelemetry::new());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+    let incoming = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+    let mut stream = ForwardStream::from_translated(
+        Box::pin(incoming),
+        None,
+        ConnectionGuard::new(Connections::new()),
+        telemetry,
+        FramePolicy::default(),
+    );
+
+    tx.send(Ok(Bytes::from_static(
+        b"data: {\"id\":\"c1\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"a\"}}]}\n\n",
+    )))
+    .unwrap();
+    let first = tokio::time::timeout(Duration::from_millis(25), stream.next())
+        .await
+        .expect("first reasoning chunk should bypass coalescing")
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("\"reasoning_content\":\"a\""));
+
+    tx.send(Ok(Bytes::from_static(
+        b"data: {\"id\":\"c1\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"bc\"}}]}\n\n",
+    )))
+    .unwrap();
+    let second = tokio::time::timeout(Duration::from_millis(200), stream.next())
+        .await
+        .expect("buffered short reasoning chunk should flush on time window even while upstream is idle")
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&second).contains("\"reasoning_content\":\"bc\""));
+    drop(tx);
+    assert!(stream.next().await.is_none());
+}

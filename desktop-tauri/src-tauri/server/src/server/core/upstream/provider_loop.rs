@@ -2479,7 +2479,14 @@ async fn attempt_stateful(
                     return Ok(ForwardOutcome::Stream {
                         status,
                         stream: Box::new(super::ForwardStream::from_translated(
-                            Box::pin(stream), slot.take(), connections.handoff(),
+                            super::stall::lifetime_guard(
+                                Box::pin(stream),
+                                std::time::Duration::from_millis(
+                                    crate::server::config::stream_max_lifetime_ms(),
+                                ),
+                            ),
+                            slot.take(),
+                            connections.handoff(),
                             ctx.telemetry.clone(),
                             super::sse::FramePolicy::with_rewrite(Some(super::sse::ModelRewrite {
                                 requested: model,
@@ -2528,11 +2535,12 @@ pub(super) fn attach_slot(
     slot: &mut Option<InFlightGuard>,
     connections: &mut ConnectionGuard,
 ) -> ForwardOutcome {
+    let lifetime = std::time::Duration::from_millis(crate::server::config::stream_max_lifetime_ms());
     match outcome {
         ForwardOutcome::Stream { status, stream } => ForwardOutcome::Stream {
             status,
             stream: Box::new(SlotHoldingStream {
-                inner: stream,
+                inner: Box::new(super::stall::lifetime_guard(Box::pin(stream), lifetime)),
                 _slot: slot.take(),
                 // handoff 转移所有权：本栈帧的凭证随即失效（见其说明）
                 _connection: connections.handoff(),
@@ -2541,7 +2549,7 @@ pub(super) fn attach_slot(
         ForwardOutcome::Native(mut response) => {
             if let super::native::NativeBody::Stream(stream) = response.body {
                 response.body = super::native::NativeBody::Stream(Box::new(SlotHoldingStream {
-                    inner: stream,
+                    inner: Box::new(super::stall::lifetime_guard(Box::pin(stream), lifetime)),
                     _slot: slot.take(),
                     _connection: connections.handoff(),
                 }));
@@ -2597,6 +2605,9 @@ async fn cap_cleared(
     let Some(account_id) = target.account_id.as_deref() else {
         return;
     };
+    if !service.store.needs_cooldown_clear_on_success(account_id, provider_id, model) {
+        return;
+    }
     let store = service.store.clone();
     let id = account_id.to_string();
     let wire_model = model.to_string();

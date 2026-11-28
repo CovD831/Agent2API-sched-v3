@@ -70,8 +70,8 @@ use crate::server::logging;
 
 use super::usage::RequestTelemetry;
 
-/// 思考（reasoning_content）帧合并阈值（照抄 Node 的 REASONING_COALESCE_CHARS）
-pub const REASONING_COALESCE_CHARS: usize = 60;
+/// 思考（reasoning_content）帧合并阈值（首帧直通，后续按短窗口/小字符阈值合并以兼顾首字与流畅度）
+pub const REASONING_COALESCE_CHARS: usize = 16;
 
 /// 一帧的输出：`Bytes` 已经是完整的 `data: ...\n\n` 字节串
 pub type Frame = Bytes;
@@ -216,6 +216,7 @@ struct FrameMeta {
 pub struct ReasoningCoalescer {
     acc: String,
     meta: FrameMeta,
+    emitted_first_reasoning: bool,
     /// 跨 chunk 的半行缓冲（网络分片不会按行对齐）
     ///
     /// 缓冲的是**字节**而不是 String：思考内容里中文字符占大头，而 TCP 分片
@@ -248,12 +249,26 @@ impl ReasoningCoalescer {
         Self {
             acc: String::new(),
             meta: FrameMeta::default(),
+            emitted_first_reasoning: false,
             tail: Vec::new(),
             telemetry: None,
             rewrite: None,
             strip_newline_chunks: false,
             native_tools: Default::default(),
         }
+    }
+
+    pub fn has_buffered_reasoning(&self) -> bool {
+        !self.acc.is_empty()
+    }
+
+    pub fn flush_pending(&mut self) -> Option<Frame> {
+        if self.acc.is_empty() {
+            return None;
+        }
+        let frame = self.coalesced_frame();
+        self.acc.clear();
+        Some(frame)
     }
 
     /// 带 usage 旁路槽的合并器（流式转发用；`new()` 保留给无统计需求的调用点）
@@ -411,7 +426,11 @@ impl ReasoningCoalescer {
             if let Some(text) = reasoning {
                 self.acc.push_str(&text);
             }
-            if self.acc.chars().count() >= REASONING_COALESCE_CHARS {
+            if !self.emitted_first_reasoning && !self.acc.is_empty() {
+                self.emitted_first_reasoning = true;
+                out.push(self.coalesced_frame());
+                self.acc.clear();
+            } else if self.acc.chars().count() >= REASONING_COALESCE_CHARS {
                 out.push(self.coalesced_frame());
                 self.acc.clear();
             }
@@ -617,15 +636,18 @@ mod tests {
 
     #[test]
     fn a_dropped_keepalive_does_not_flush_the_reasoning_accumulator() {
+        let priming = frame(json!({"reasoning_content": "想"}));
         let reasoning = frame(json!({"reasoning_content": "abc"}));
         let keepalive = frame(json!({"content": "\n"}));
         let mut on = coalescer(true);
+        assert!(feed(&mut on, &priming).contains("reasoning_content"), "首帧纯思考增量应当立即直通");
         let mut out = feed(&mut on, &reasoning);
         out.push_str(&feed(&mut on, &keepalive));
         assert!(out.is_empty(), "纯噪声帧既不该下发，也不该把攒了一半的思考结掉: {out}");
         // 关掉时它是普通的「非 reasoning 事件」，照旧会冲刷 —— 这条对照证明
         // 开启丢弃确实改变了这一帧的处理路径，而不是一直如此
         let mut off = coalescer(false);
+        assert!(feed(&mut off, &priming).contains("reasoning_content"));
         let mut out_off = feed(&mut off, &reasoning);
         out_off.push_str(&feed(&mut off, &keepalive));
         assert!(out_off.contains("reasoning_content"), "关着时应先冲刷思考帧: {out_off}");
@@ -824,15 +846,40 @@ mod tests {
         assert!(out.contains(terminal.trim_end()), "保留时原样透传: {out}");
     }
 
-    /// 反对照：真正纯粹的思考增量照旧被累积（改动只放开"带终止/统计信息"那一格，
-    /// 没有把透传面扩大成"每帧都原样发"）。
+    /// 反对照：首帧思考直通后，后续未满阈值的纯思考增量仍应被累积（改动只放开「首帧」与
+    /// 「带终止/统计信息」那两格，没有把透传面扩大成「每帧都原样发」）。
     #[test]
     fn a_pure_reasoning_delta_is_still_absorbed() {
         let mut coalescer = ReasoningCoalescer::new();
         assert!(
-            feed(&mut coalescer, &frame(json!({"reasoning_content": "边想"}))).is_empty(),
-            "没有终止信息的思考帧仍应攒着"
+            feed(&mut coalescer, &frame(json!({"reasoning_content": "先"}))).contains("reasoning_content"),
+            "首帧非空纯思考增量应当立即直通"
         );
+        assert!(
+            feed(&mut coalescer, &frame(json!({"reasoning_content": "边想"}))).is_empty(),
+            "首帧之后的短纯思考增量仍应攒着"
+        );
+    }
+
+    #[test]
+    fn first_non_empty_reasoning_delta_flushes_immediately_while_subsequent_deltas_coalesce() {
+        let mut coalescer = ReasoningCoalescer::new();
+        // 空 reasoning_content 不得消耗首帧直通资格或发出空帧
+        assert!(feed(&mut coalescer, &frame(json!({"reasoning_content": ""}))).is_empty());
+
+        let first = feed(&mut coalescer, &frame(json!({"reasoning_content": "想"})));
+        assert!(first.contains(r#""reasoning_content":"想""#), "首帧非空思考应立即直通: {first}");
+
+        assert!(feed(&mut coalescer, &frame(json!({"reasoning_content": "短"}))).is_empty());
+        assert!(coalescer.has_buffered_reasoning());
+        let flushed = String::from_utf8(coalescer.flush_pending().unwrap().to_vec()).unwrap();
+        assert!(flushed.contains(r#""reasoning_content":"短""#));
+        assert!(!coalescer.has_buffered_reasoning());
+
+        // 后续增量凑满 REASONING_COALESCE_CHARS 时照常合并冲刷
+        assert!(feed(&mut coalescer, &frame(json!({"reasoning_content": "12345678"}))).is_empty());
+        let batched = feed(&mut coalescer, &frame(json!({"reasoning_content": "90abcdef"})));
+        assert!(batched.contains(r#""reasoning_content":"1234567890abcdef""#), "后续思考应按阈值合并: {batched}");
     }
 
     /// `carries_terminal_signal` 的三支判据各自单独成立。
@@ -890,6 +937,7 @@ mod tests {
     fn the_accumulated_reasoning_is_flushed_before_the_terminal_frame() {
         let terminal = officeace_terminal_frame();
         let mut coalescer = ReasoningCoalescer::new();
+        assert!(feed(&mut coalescer, &frame(json!({"reasoning_content": "开"}))).contains("开"));
         let mut out = feed(&mut coalescer, &frame(json!({"reasoning_content": "先想一句"})));
         assert!(out.is_empty(), "还没到阈值时不该下发");
         out.push_str(&feed(&mut coalescer, &terminal));

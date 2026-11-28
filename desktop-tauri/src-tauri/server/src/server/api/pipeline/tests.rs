@@ -161,3 +161,26 @@ fn empty_terminal_table_never_retains_response_bytes() {
     assert!(!scan.seen);
     assert!(scan.window.is_empty());
 }
+
+#[test]
+fn sse_response_disables_proxy_buffering() {
+    let response = super::sse_response(
+        axum::http::StatusCode::OK,
+        Box::new(futures::stream::empty()),
+    );
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|value| value.to_str().ok()),
+        Some("no")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+}

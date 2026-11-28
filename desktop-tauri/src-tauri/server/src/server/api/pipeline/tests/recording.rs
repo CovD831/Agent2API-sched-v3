@@ -204,3 +204,25 @@ async fn io_error_is_forwarded_and_does_not_replace_the_recorded_cause() {
     assert_eq!(row["error"], "上游连接中断");
     assert_eq!(row["totalTokens"], 0);
 }
+
+#[tokio::test]
+async fn lifetime_guard_hung_verdict_settles_408_and_zeros_usage() {
+    let (_dir, stats) = temp_stats();
+    let (context, _telemetry) = context_for(stats.clone());
+    let guarded = crate::server::core::upstream::stall::lifetime_guard(
+        Box::pin(futures::stream::pending()),
+        std::time::Duration::from_millis(25),
+    );
+    let mut stream = RecordingStream::with_terminals(Box::new(guarded), context, terminal::CHAT);
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert!(crate::server::core::upstream::stall::is_hung_verdict(&error.to_string()));
+    drop(stream);
+    let row = only_row(&stats);
+    assert_eq!(row["status"], 408);
+    assert!(row["error"]
+        .as_str()
+        .is_some_and(crate::server::core::upstream::stall::is_hung_verdict));
+    assert_eq!(row["promptTokens"], 0);
+    assert_eq!(row["completionTokens"], 0);
+    assert_eq!(row["totalTokens"], 0);
+}

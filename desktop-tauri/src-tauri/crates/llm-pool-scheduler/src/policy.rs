@@ -154,6 +154,9 @@ impl SchedulingPolicy for HysteresisLoadBalancePolicy {
         if provider.wave_degraded {
             cost += self.config.wave_degraded_penalty;
         }
+        if node.proxy_wave_degraded {
+            cost += self.config.wave_degraded_penalty;
+        }
         if is_sticky_hit {
             cost -= self.config.sticky_affinity_bonus;
         }
@@ -268,8 +271,13 @@ impl SchedulingPolicy for PrimalDualCongestionPolicy {
                 0.0
             };
         let tier_offset = (node.priority_tier as f64) * 25_000.0;
+        let wave_penalty = if provider.wave_degraded || node.proxy_wave_degraded {
+            15_000.0
+        } else {
+            0.0
+        };
         let cache_rebate = if is_sticky_hit { self.cache_value_ms } else { 0.0 };
-        Some(tier_offset + marginal_delay_ms + shadow_cost - cache_rebate)
+        Some(tier_offset + marginal_delay_ms + shadow_cost + wave_penalty - cache_rebate)
     }
 
     fn attempt_ttft_deadline_ms(

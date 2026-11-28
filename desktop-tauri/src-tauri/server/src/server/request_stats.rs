@@ -104,8 +104,9 @@ pub fn request_date_bounds(start: NaiveDate, end: NaiveDate) -> Option<(i64, i64
     Some((clock::local_midnight_ms(start), clock::local_midnight_ms(next)))
 }
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use chrono::NaiveDate;
@@ -262,6 +263,16 @@ mod orphan_sweep_flag_tests {
 }
 
 
+pub(super) struct PendingStarted {
+    pub(super) id: String,
+    pub(super) ts: i64,
+    pub(super) model: String,
+    pub(super) client_model: String,
+    pub(super) client_reasoning: String,
+    pub(super) source: RequestSource,
+    pub(super) is_test: bool,
+}
+
 /// 请求统计存储本体。所有公开方法取 `&self`，内部一把 `Mutex` 串行化调用序列。
 pub struct RequestStats {
     /// SQLite 句柄。`None` = 数据库打开失败（启动时已记日志）。
@@ -318,6 +329,9 @@ pub struct RequestStats {
     filters_cache: filters_cache::FilterOptionsCache,
     /// 按天聚合行的内存写合并缓冲：消除每笔请求都反序列化/重写数千账号 JSON 大字段造成的 WAL 暴涨。
     daily_buffer: Mutex<daily::DailyBuffer>,
+    /// 待合并批写的进行中起始记录（锁序要求：只能单独加锁，或先拿 `self.guard()` 再加本锁）。
+    pending_started: Mutex<HashMap<String, PendingStarted>>,
+    started_flush_scheduled: AtomicBool,
 }
 
 impl RequestStats {
@@ -361,7 +375,51 @@ impl RequestStats {
             counts: counts::CountsCache::default(),
             filters_cache: filters_cache::FilterOptionsCache::new(),
             daily_buffer: Mutex::new(daily::DailyBuffer::default()),
+            pending_started: Mutex::new(HashMap::new()),
+            started_flush_scheduled: AtomicBool::new(false),
         }
+    }
+
+    pub(super) fn push_pending_started(&self, item: PendingStarted) -> usize {
+        let mut map = self
+            .pending_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        map.entry(item.id.clone()).or_insert(item);
+        map.len()
+    }
+
+    pub(super) fn has_pending_started(&self) -> bool {
+        !self
+            .pending_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+    }
+
+    pub(super) fn take_pending_started(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        id: &str,
+    ) -> Option<PendingStarted> {
+        self.pending_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(id)
+    }
+
+    pub(super) fn drain_pending_started(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+    ) -> Vec<PendingStarted> {
+        let mut map = self
+            .pending_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if map.is_empty() {
+            return Vec::new();
+        }
+        map.drain().map(|(_, item)| item).collect()
     }
 
     /// 取锁；中毒（某次持锁 panic）时接管继续用 —— 与 `LogStore::guard` /
@@ -642,6 +700,9 @@ impl RequestStats {
     /// 读取**失败**（HTTP 错误）走的是另一条路（`render('读取请求日志失败…')`
     /// 与徽标退成「—」），而这里返回的是「成功但为空」——两者的区别在前端是有意的。
     pub fn query_requests(&self, filter: &RequestQuery) -> Value {
+        if self.has_pending_started() {
+            self.flush_pending_started();
+        }
         // limit 夹在 [1, MAX_LIMIT]：前端传 0 或十万都不该让接口躺平
         let limit = filter.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let plan = sql::FilterPlan::of(filter);
@@ -681,6 +742,9 @@ impl RequestStats {
 
     /// 按 `rowId` 或 `id` (+ 可选 `ts`) 读取单条请求的完整详情（含选路快照 / 尝试明细 / 敏感词 / 识别证据）。
     pub fn request_detail(&self, row_id: Option<i64>, id: Option<&str>, ts: Option<i64>) -> Option<Value> {
+        if self.has_pending_started() {
+            self.flush_pending_started();
+        }
         let loaded = self.with_read_conn(|conn| match row_id.filter(|value| *value > 0) {
             Some(row_id) => sql::select_detail_by_row_id(conn, row_id),
             None => match id.map(str::trim).filter(|value| !value.is_empty()) {
@@ -834,6 +898,7 @@ impl RequestStats {
     /// （本例只有一个连接，实际不会），SQLite 会保留 WAL 而不报错 —— 所以这里
     /// 忽略返回值是安全的：失败只意味着「这次没收敛」，数据仍然完好。
     pub fn flush(&self) {
+        self.flush_pending_started();
         let guard = self.guard();
         let _ = self.with_conn_mut(&guard, |conn| {
             self.flush_daily_in_conn(conn)?;
@@ -907,6 +972,7 @@ impl RequestStats {
 
 impl Drop for RequestStats {
     fn drop(&mut self) {
+        self.flush_pending_started();
         let guard = self.guard();
         let _ = self.with_conn_mut(&guard, |conn| self.flush_daily_in_conn(conn));
     }

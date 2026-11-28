@@ -742,3 +742,98 @@ fn legacy_inline_rows_still_decode_for_list_and_detail() {
     assert_eq!(detail["route"]["stickyHit"], true);
     assert_eq!(detail["clientEvidence"]["clientName"], "Legacy Client");
 }
+
+#[tokio::test]
+async fn enqueue_started_coalesces_with_record_finalize_update_and_query() {
+    use std::sync::Arc;
+    use super::RunningProgress;
+
+    let now = crate::server::logging::now_ms();
+
+    // 1. Fast completion before flush: record drops pending start and writes 1 terminal row cleanly.
+    {
+        let (_dir, stats) = temp_stats();
+        let stats = Arc::new(stats);
+        let item = entry("fast-done", now);
+        stats.enqueue_started(&item.id, now, &item.model, &item.model, "", &item.source, false);
+        stats.record(item);
+        stats.flush_pending_started();
+        let page = stats.query_requests(&RequestQuery::default());
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["running"], 0);
+        assert_eq!(page["entries"][0]["status"], 200);
+        assert_eq!(page["entries"][0]["totalTokens"], 10);
+    }
+
+    // 2. Client disconnect before flush: finalize_interrupted materializes and settles 408.
+    {
+        let (_dir, stats) = temp_stats();
+        let stats = Arc::new(stats);
+        stats.enqueue_started("early-abort", now, "m", "m", "", &source("zcode", "key:a"), false);
+        stats.finalize_interrupted(
+            "early-abort",
+            "客户端中断",
+            &RunningProgress {
+                provider: "codearts".into(),
+                account_id: "a1".into(),
+                account_name: "A1".into(),
+                upstream_model: "m".into(),
+                upstream_reasoning: String::new(),
+                attempts: 1,
+                first_response_ms: None,
+                phase: "connecting".into(),
+                phase_started_at: Some(now),
+                attempt_details: Vec::new(),
+                route: None,
+                sensitive_hits: Vec::new(),
+            },
+            now + 15,
+        );
+        let page = stats.query_requests(&RequestQuery::default());
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["running"], 0);
+        assert_eq!(page["entries"][0]["status"], 408);
+        let summary = stats.usage_summary("all", None, None);
+        assert_eq!(summary["overview"]["requests"], 1);
+    }
+
+    // 3. Live progress update before flush: update_running inserts and updates in one tx.
+    {
+        let (_dir, stats) = temp_stats();
+        let stats = Arc::new(stats);
+        stats.enqueue_started("in-flight", now, "m", "m", "", &source("zcode", "key:a"), false);
+        stats.update_running(
+            "in-flight",
+            &RunningProgress {
+                provider: "loomy".into(),
+                account_id: "a2".into(),
+                account_name: "A2".into(),
+                upstream_model: "wire-m".into(),
+                upstream_reasoning: String::new(),
+                attempts: 2,
+                first_response_ms: Some(120),
+                phase: "streaming".into(),
+                phase_started_at: Some(now + 120),
+                attempt_details: Vec::new(),
+                route: None,
+                sensitive_hits: Vec::new(),
+            },
+        );
+        let page = stats.query_requests(&RequestQuery::default());
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["running"], 1);
+        assert_eq!(page["entries"][0]["provider"], "loomy");
+        assert_eq!(page["entries"][0]["attempts"], 2);
+    }
+
+    // 4. Read query before timer flush forces pending started rows visible.
+    {
+        let (_dir, stats) = temp_stats();
+        let stats = Arc::new(stats);
+        stats.enqueue_started("queued-read", now, "m", "m", "", &source("zcode", "key:a"), false);
+        let page = stats.query_requests(&RequestQuery::default());
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["running"], 1);
+        assert_eq!(page["entries"][0]["id"], "queued-read");
+    }
+}

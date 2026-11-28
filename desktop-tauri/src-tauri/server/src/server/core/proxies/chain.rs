@@ -68,6 +68,21 @@ impl SelectedPath {
         };
         Ok(wire_value(&proxy))
     }
+
+    pub(crate) fn cache_key(&self) -> String {
+        match &self.choice {
+            PathChoice::Direct => "direct".to_string(),
+            PathChoice::Single(proxy) => {
+                let mut hash = Sha256::new();
+                hash_proxy(&mut hash, proxy);
+                let digest: String = hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+                format!("single:{digest}")
+            }
+            PathChoice::Chain { target, upstream } => {
+                format!("chain:{}", fingerprint(target, upstream))
+            }
+        }
+    }
 }
 
 const MAX_BRIDGES: usize = 128;
@@ -98,15 +113,18 @@ fn bridges() -> &'static Mutex<HashMap<String, Arc<Bridge>>> {
     BRIDGES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn hash_proxy(hash: &mut Sha256, value: &ResolvedProxy) {
+    for part in [&value.protocol, &value.host, &value.username, &value.password] {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part.as_bytes());
+    }
+    hash.update(value.port.unwrap_or(0).to_be_bytes());
+}
+
 fn fingerprint(proxy: &ResolvedProxy, upstream: &ResolvedProxy) -> String {
     let mut hash = Sha256::new();
-    for value in [proxy, upstream] {
-        for part in [&value.protocol, &value.host, &value.username, &value.password] {
-            hash.update((part.len() as u64).to_be_bytes());
-            hash.update(part.as_bytes());
-        }
-        hash.update(value.port.unwrap_or(0).to_be_bytes());
-    }
+    hash_proxy(&mut hash, proxy);
+    hash_proxy(&mut hash, upstream);
     hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

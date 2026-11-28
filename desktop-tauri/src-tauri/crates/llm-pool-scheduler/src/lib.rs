@@ -633,6 +633,12 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                                 slow_streak,
                                 dual_shadow_price: shadow,
                                 total_dispatched: slot.dispatched.load(Ordering::Relaxed),
+                                proxy_wave_degraded: self.wave_guard.is_proxy_group_degraded(
+                                    &meta.provider,
+                                    &meta.proxy_group,
+                                    req.now_ms,
+                                    &cfg.health,
+                                ),
                             };
                             let deadline =
                                 policy.attempt_ttft_deadline_ms(&view, &prov_view, req.attempt_index);
@@ -718,6 +724,12 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                                 slow_streak,
                                 dual_shadow_price: shadow,
                                 total_dispatched: slot.dispatched.load(Ordering::Relaxed),
+                                proxy_wave_degraded: self.wave_guard.is_proxy_group_degraded(
+                                    &meta.provider,
+                                    &meta.proxy_group,
+                                    req.now_ms,
+                                    &cfg.health,
+                                ),
                             };
                             let deadline =
                                 policy.attempt_ttft_deadline_ms(&view, &prov_view, req.attempt_index);
@@ -769,6 +781,12 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                     slow_streak,
                     dual_shadow_price: shadow,
                     total_dispatched: slot.dispatched.load(Ordering::Relaxed),
+                    proxy_wave_degraded: self.wave_guard.is_proxy_group_degraded(
+                        &meta.provider,
+                        &meta.proxy_group,
+                        req.now_ms,
+                        &cfg.health,
+                    ),
                 };
                 let prov_view = prov_views
                     .get(meta.provider.as_str())
@@ -1384,6 +1402,12 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             slow_streak,
             dual_shadow_price: shadow,
             total_dispatched: slot.dispatched.load(Ordering::Relaxed),
+            proxy_wave_degraded: self.wave_guard.is_proxy_group_degraded(
+                &meta.provider,
+                &meta.proxy_group,
+                now_ms,
+                health_cfg,
+            ),
         };
         let prov_view = ProviderRuntimeView {
             provider: meta.provider.clone(),
@@ -2174,5 +2198,62 @@ mod tests {
         });
         let (d_mid, _l_mid) = scheduler2.schedule(&req).unwrap();
         assert_eq!(d_mid.attempt_ttft_deadline_ms, 23_000);
+    }
+
+    #[test]
+    fn proxy_group_wave_penalizes_healthy_nodes_sharing_degraded_egress() {
+        let scheduler = Scheduler::default();
+        let mut nodes = Vec::new();
+        for i in 0..6 {
+            let mut d = NodeDescriptor::new(format!("bad-{i}"), "codearts");
+            d.proxy_group = "bad-egress".into();
+            d.max_concurrent = 4;
+            nodes.push(d);
+        }
+        for i in 0..4 {
+            let mut d = NodeDescriptor::new(format!("good-{i}"), "codearts");
+            d.proxy_group = "good-egress".into();
+            d.max_concurrent = 4;
+            nodes.push(d);
+        }
+        scheduler.sync_nodes(&nodes, 1_000);
+
+        // 5 distinct accounts failing on bad-egress trip WaveGuard on x:codearts:bad-egress;
+        // bad-5 remains Active, but inherits the proxy_wave_degraded routing penalty.
+        for i in 0..5 {
+            scheduler.record_feedback(AttemptFeedback {
+                node_id: format!("bad-{i}"),
+                model: "glm-5.3".into(),
+                sticky_key: String::new(),
+                sticky_ttl_ms: 0,
+                kind: AttemptFeedbackKind::TransientFailure {
+                    is_network_or_proxy: true,
+                },
+                now_ms: 10_000 + i * 100,
+            });
+        }
+
+        let providers = ["codearts"];
+        let req = ScheduleRequest {
+            model: "glm-5.3",
+            allowed_providers: &providers,
+            sticky_key: "",
+            sticky_ttl_ms: 0,
+            excluded_node_ids: &[],
+            route_excluded_ids: None,
+            route_allowed_ids: None,
+            pinned_node_id: None,
+            attempt_index: 0,
+            now_ms: 11_000,
+        };
+        for _ in 0..40 {
+            let (dec, lease) = scheduler.schedule(&req).expect("selects healthy egress node");
+            assert!(
+                dec.node_id.starts_with("good-"),
+                "expected proxy_wave_degraded bad-5 to lose to good-egress nodes, got {}",
+                dec.node_id
+            );
+            drop(lease);
+        }
     }
 }

@@ -74,7 +74,7 @@ impl Context {
         let call = self.conversation.as_ref().ok_or_else(invalid)?;
         let path = call.selected_path(&self.shared,&self.account)?;
         let deadline = self.call_deadline.min(Instant::now() + Duration::from_secs(30));
-        let client = tokio::time::timeout_at(deadline,FrozenHttpClient::from_path(path)).await
+        let client = tokio::time::timeout_at(deadline, FrozenHttpClient::from_path_single_session_keepalive(path)).await
             .map_err(|_| invalid())?.map_err(|_| invalid())?;
         let record = self.shared.callbacks.store_get("codearts".into(),self.account.clone()).await?;
         if record["provider"] != "codearts" || record["public"]["enabled"] == false { return Err(invalid()); }

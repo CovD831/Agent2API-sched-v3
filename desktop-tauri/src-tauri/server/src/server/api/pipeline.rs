@@ -698,7 +698,14 @@ impl futures::Stream for RecordingStream {
                     }
                 }
             }
-            std::task::Poll::Ready(Some(Err(_))) => {}
+            std::task::Poll::Ready(Some(Err(error))) => {
+                if let Some(context) = &this.context {
+                    let text = error.to_string();
+                    if crate::server::core::upstream::stall::is_hung_verdict(&text) {
+                        context.telemetry.note_error(&text);
+                    }
+                }
+            }
             std::task::Poll::Ready(None) => {}
             std::task::Poll::Pending => {}
         }
@@ -842,6 +849,10 @@ pub fn sse_response(
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+    headers.insert(
+        header::HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
     response
 }
 

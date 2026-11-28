@@ -82,6 +82,8 @@ pub struct NodeRuntimeView<'a> {
     pub dual_shadow_price: f64,
     /// Total dispatched requests on this slot.
     pub total_dispatched: u64,
+    /// Whether this slot's egress proxy group is currently experiencing a WaveGuard surge.
+    pub proxy_wave_degraded: bool,
 }
 
 /// Provider/channel aggregate runtime view passed to [`crate::policy::SchedulingPolicy`].

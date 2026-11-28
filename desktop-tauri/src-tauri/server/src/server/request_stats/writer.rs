@@ -44,6 +44,7 @@ impl RequestStats {
         let maintain = self.should_maintain();
         let outcome = {
             let guard = self.guard();
+            let _ = self.take_pending_started(&guard, &record.id);
             self.with_conn_mut(&guard, |conn| {
                 let tx = conn.transaction()?;
                 let terminal_exists = !record.id.is_empty() && sql::terminal_record_exists(&tx, &record.id)?;
@@ -138,6 +139,93 @@ impl RequestStats {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_started(
+        self: &std::sync::Arc<Self>,
+        id: &str,
+        ts: i64,
+        model: &str,
+        client_model: &str,
+        client_reasoning: &str,
+        source: &RequestSource,
+        is_test: bool,
+    ) {
+        if id.is_empty() {
+            return;
+        }
+        let pending_len = self.push_pending_started(super::PendingStarted {
+            id: id.to_string(),
+            ts,
+            model: model.to_string(),
+            client_model: client_model.to_string(),
+            client_reasoning: client_reasoning.to_string(),
+            source: source.clone(),
+            is_test,
+        });
+        self.filters_cache.note_written(
+            model,
+            "",
+            "",
+            &source.client,
+            &source.api_key.filter_value(),
+        );
+        if self
+            .started_flush_scheduled
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let stats = std::sync::Arc::clone(self);
+                crate::spawn_task(async move {
+                    if pending_len < 32 {
+                        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    }
+                    let _ = tokio::task::spawn_blocking(move || stats.flush_pending_started()).await;
+                });
+            } else {
+                self.flush_pending_started();
+            }
+        }
+    }
+
+    pub fn flush_pending_started(&self) {
+        self.started_flush_scheduled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let guard = self.guard();
+        let batch = self.drain_pending_started(&guard);
+        if batch.is_empty() {
+            return;
+        }
+        let committed = self
+            .with_conn_mut(&guard, |conn| {
+                let tx = conn.transaction()?;
+                let mut inserted = false;
+                for item in &batch {
+                    inserted |= sql::insert_started_request(
+                        &tx,
+                        &item.id,
+                        item.ts,
+                        &item.model,
+                        &item.client_model,
+                        &item.client_reasoning,
+                        &item.source,
+                        item.is_test,
+                    )?;
+                }
+                tx.commit()?;
+                Ok(inserted)
+            })
+            .unwrap_or(false);
+        if committed {
+            crate::server::core::panel_events::notify_requests();
+        }
+    }
+
     pub fn sweep_stale_running(&self) {
         let bounds = self.retention_bounds();
         let guard = self.guard();
@@ -162,10 +250,28 @@ impl RequestStats {
             return;
         }
         let guard = self.guard();
-        let updated = self
-            .with_conn_mut(&guard, |conn| sql::update_running_progress(conn, id, progress))
-            .unwrap_or(0);
-        if updated > 0 {
+        let pending = self.take_pending_started(&guard, id);
+        let outcome = self.with_conn_mut(&guard, |conn| {
+            let tx = conn.transaction()?;
+            let mut changed = false;
+            if let Some(item) = pending.as_ref() {
+                changed |= sql::insert_started_request(
+                    &tx,
+                    &item.id,
+                    item.ts,
+                    &item.model,
+                    &item.client_model,
+                    &item.client_reasoning,
+                    &item.source,
+                    item.is_test,
+                )?;
+            }
+            let updated = sql::update_running_progress(&tx, id, progress)?;
+            changed |= updated > 0;
+            tx.commit()?;
+            Ok(changed)
+        });
+        if outcome == Some(true) {
             self.filters_cache.note_written("", &progress.upstream_model, &progress.provider, "", "");
             crate::server::core::panel_events::notify_requests();
         }

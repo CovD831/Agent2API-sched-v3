@@ -697,6 +697,8 @@ fn lock_table<'a>(
 /// Node 版此时补写一帧 `data: {"error": {...}}` + `data: [DONE]`（见
 /// server.mjs 551-554）。这里做同一件事：把两帧塞进流再正常结束 ——
 /// 对 OpenAI SDK 来说，这比「连接被截断」更容易识别成一次失败的补全。
+const REASONING_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
+
 pub struct ForwardStream {
     /// 上游字节流（已 consume 掉 Response，流自身是 'static）。
     ///
@@ -707,6 +709,7 @@ pub struct ForwardStream {
     /// 收尾，描述口径也一致。
     inner: Option<futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>>,
     coalescer: ReasoningCoalescer,
+    reasoning_flush: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     /// 上游已结束（不再 poll 上游，只把 pending 吐完）
     upstream_done: bool,
     /// 缓存的待下发帧（一个上游 chunk 可能产出多帧）
@@ -795,6 +798,7 @@ impl ForwardStream {
             inner: Some(inner),
             coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone())
                 .with_policy(policy),
+            reasoning_flush: None,
             upstream_done: false,
             pending: std::collections::VecDeque::new(),
             _slot: slot,
@@ -826,10 +830,22 @@ impl Stream for ForwardStream {
                 None => std::task::Poll::Ready(None),
             };
             match next {
-                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Pending => {
+                    if let Some(timer) = self.reasoning_flush.as_mut() {
+                        if std::future::Future::poll(timer.as_mut(), context).is_ready() {
+                            self.reasoning_flush = None;
+                            if let Some(frame) = self.coalescer.flush_pending() {
+                                self.pending.push_back(frame);
+                                continue;
+                            }
+                        }
+                    }
+                    return std::task::Poll::Pending;
+                }
                 std::task::Poll::Ready(None) => {
                     // 先释放真实来源，再排收尾帧；外层记账槽仍保留到响应流结束。
                     drop(self.inner.take());
+                    self.reasoning_flush = None;
                     self.upstream_done = true;
                     for frame in self.coalescer.finish() {
                         self.pending.push_back(frame);
@@ -845,12 +861,21 @@ impl Stream for ForwardStream {
                     for frame in self.coalescer.push(&bytes[..]) {
                         self.pending.push_back(frame);
                     }
+                    if self.coalescer.has_buffered_reasoning() {
+                        if self.reasoning_flush.is_none() {
+                            self.reasoning_flush =
+                                Some(Box::pin(tokio::time::sleep(REASONING_FLUSH_INTERVAL)));
+                        }
+                    } else {
+                        self.reasoning_flush = None;
+                    }
                 }
                 std::task::Poll::Ready(Some(Err(error))) => {
                     // 上游流式传输中断：那是**正常路径**（客户端断开、上游主动结束），
                     // 不 panic。先把已累积的 reasoning 冲刷出去，再补上
                     // 「错误帧 + [DONE]」收尾（与 Node 一致）。
                     drop(self.inner.take());
+                    self.reasoning_flush = None;
                     self.upstream_done = true;
                     for frame in self.coalescer.finish() {
                         self.pending.push_back(frame);

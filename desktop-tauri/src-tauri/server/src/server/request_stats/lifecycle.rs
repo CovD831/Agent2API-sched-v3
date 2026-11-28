@@ -48,9 +48,22 @@ impl RequestStats {
         if id.is_empty() { return; }
         let bounds = self.retention_bounds();
         let guard = self.guard();
+        let pending = self.take_pending_started(&guard, id);
         let ok = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
             self.flush_daily_in_conn(&tx)?;
+            if let Some(item) = pending.as_ref() {
+                sql::insert_started_request(
+                    &tx,
+                    &item.id,
+                    item.ts,
+                    &item.model,
+                    &item.client_model,
+                    &item.client_reasoning,
+                    &item.source,
+                    item.is_test,
+                )?;
+            }
             sql::update_running_progress(&tx, id, progress)?;
             let mut entries = {
                 let mut stmt = tx.prepare(&format!(

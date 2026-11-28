@@ -134,6 +134,28 @@ impl AccountStore {
         pick_policy_cooldown(&state, provider, model, logging::now_ms())
     }
 
+    pub(crate) fn needs_cooldown_clear_on_success(&self, account_id: &str, provider: &str, model: &str) -> bool {
+        if self.route_account(account_id).is_some_and(|account| {
+            account.get("rateLimits").and_then(|limits| limits.get(model)).is_some()
+                || account
+                    .get("routingCooldowns")
+                    .and_then(Value::as_object)
+                    .is_some_and(|limits| !limits.is_empty())
+        }) {
+            return true;
+        }
+        let Ok(guard) = self.policy_cooldown_cache().read() else {
+            return true;
+        };
+        match guard.as_ref() {
+            Some((state, _)) => state
+                .get(provider)
+                .and_then(Value::as_object)
+                .is_some_and(|limits| limits.contains_key(model) || limits.contains_key("@provider")),
+            None => true,
+        }
+    }
+
     pub(crate) fn clear_provider_policy_cooldowns(&self, account_id: &str) -> Result<usize, String> {
         let guard = self.guard();
         let record = self.record_by_id(&guard, account_id).ok_or_else(|| "账号不存在".to_string())?;
@@ -305,6 +327,59 @@ mod tests {
                 assert_eq!(store.clear_provider_policy_cooldowns(id).unwrap(), 1);
                 assert!(store.policy_cooldown_for("custom-p1", "gpt-test").is_none());
                 assert!(store.policy_cooldown_snapshot().cooldown_for("custom-p1", "gpt-test", 0).is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn needs_cooldown_clear_on_success_skips_clean_accounts_and_detects_active_marks() {
+        crate::test_support::isolated(
+            concat!(module_path!(), "::needs_cooldown_clear_on_success_skips_clean_accounts_and_detects_active_marks"),
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = Db::open(&dir.path().join("fast-clear.db")).unwrap();
+                let store = AccountStore::with_db(Some(db));
+                let account = store
+                    .add_custom_account("custom-p1", &json!({"apiKey": "sk-1"}), Some("A1"))
+                    .unwrap()
+                    .account;
+                let id = account["id"].as_str().unwrap();
+
+                // Warm policy cooldown cache with empty state first.
+                let _ = store.policy_cooldown_snapshot();
+                assert!(!store.needs_cooldown_clear_on_success(id, "custom-p1", "gpt-test"));
+
+                let model_rule = ErrorRule {
+                    id: "rl-model".into(),
+                    name: "Model RL".into(),
+                    kind: ErrorKind::RateLimit,
+                    statuses: vec![429],
+                    code: String::new(),
+                    provider: "*".into(),
+                    model: String::new(),
+                    enabled: true,
+                    action: ErrorAction::SwitchAccount,
+                    cooldown: CooldownMode::Fixed,
+                    fallback_seconds: 60,
+                    exponential: false,
+                    fallback_cap_seconds: 60,
+                    scope: CooldownScope::Model,
+                };
+                store
+                    .mark_policy_cooldown(id, "gpt-test", CooldownScope::Model, 429, None, None, "rl", &model_rule, 0)
+                    .unwrap();
+                assert!(store.needs_cooldown_clear_on_success(id, "custom-p1", "gpt-test"));
+                assert!(store.clear_rate_limit(id, "gpt-test"));
+                assert!(!store.needs_cooldown_clear_on_success(id, "custom-p1", "gpt-test"));
+
+                let provider_rule = ErrorRule {
+                    scope: CooldownScope::Provider,
+                    ..model_rule
+                };
+                store
+                    .mark_policy_cooldown(id, "gpt-test", CooldownScope::Provider, 429, None, None, "rl", &provider_rule, 0)
+                    .unwrap();
+                assert!(store.needs_cooldown_clear_on_success(id, "custom-p1", "gpt-test"));
             },
         );
     }

@@ -176,8 +176,6 @@ pub(super) async fn record_started(
     source: &RequestSource,
     is_test: bool,
 ) {
-    // 进行中行写入与调用方创建断线守卫之间不能留下可取消的等待窗口。
-    blocking::in_place(|| {
-        stats.record_started(id, ts, model, client_model, reasoning, source, is_test);
-    });
+    // 非阻塞入队后台批写，避免在转发前抢占全局 SQLite 写锁拖慢首字；终态/进度更新会按 id 合并取回。
+    stats.enqueue_started(id, ts, model, client_model, reasoning, source, is_test);
 }

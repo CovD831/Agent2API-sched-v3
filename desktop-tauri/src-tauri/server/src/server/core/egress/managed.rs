@@ -44,6 +44,24 @@ impl FrozenHttpClient {
     pub(crate) async fn from_path_with_addresses(path: chain::SelectedPath, host: &str,
         addresses: &[SocketAddr],
     ) -> Result<Self, String> {
+        Self::from_path_inner(path, host, addresses, 0, None).await
+    }
+
+    /// Single-conversation keep-alive variant for CodeArts: allows the conversation POST to reuse
+    /// the freshly opened TLS connection from its own `busy` heartbeat on the same host.
+    pub(crate) async fn from_path_single_session_keepalive(
+        path: chain::SelectedPath,
+    ) -> Result<Self, String> {
+        Self::from_path_inner(path, "", &[], 1, Some(std::time::Duration::from_secs(45))).await
+    }
+
+    async fn from_path_inner(
+        path: chain::SelectedPath,
+        host: &str,
+        addresses: &[SocketAddr],
+        max_idle_per_host: usize,
+        pool_idle_timeout: Option<std::time::Duration>,
+    ) -> Result<Self, String> {
         if !addresses.is_empty() && (!path.is_direct() || host.is_empty() || addresses.len() > 8) {
             return Err("冻结代理出口不能使用本机地址覆盖".into());
         }
@@ -55,7 +73,10 @@ impl FrozenHttpClient {
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .http1_only()
-            .pool_max_idle_per_host(0);
+            .pool_max_idle_per_host(max_idle_per_host);
+        if let Some(timeout) = pool_idle_timeout.filter(|_| max_idle_per_host > 0) {
+            builder = builder.pool_idle_timeout(timeout);
+        }
         if let Some(proxy) = endpoint.proxy() {
             // 已冻结成真实端点；禁止使用 transport_proxy/resolved_builder 再调 endpoint。
             if proxy.non_direct {

@@ -272,25 +272,55 @@ impl WaveGuard {
 
     pub fn is_provider_degraded(&self, provider: &str, now_ms: i64, cfg: &HealthConfig) -> bool {
         let map = self.by_scope.lock().unwrap_or_else(|e| e.into_inner());
-        let key = format!("p:{provider}");
-        let Some(queue) = map.get(&key) else {
+        if map.is_empty() {
             return false;
-        };
-        let cutoff = now_ms.saturating_sub(cfg.wave_window_ms);
-        let mut seen = Vec::with_capacity(cfg.wave_distinct_accounts_trigger);
-        for item in queue.iter().rev() {
-            if item.at_ms < cutoff {
-                break;
-            }
-            if !seen.contains(&item.node_hash) {
-                seen.push(item.node_hash);
-                if seen.len() >= cfg.wave_distinct_accounts_trigger {
-                    return true;
-                }
+        }
+        let key = format!("p:{provider}");
+        is_scope_degraded(&map, &key, now_ms, cfg)
+    }
+
+    pub fn is_proxy_group_degraded(
+        &self,
+        provider: &str,
+        proxy_group: &str,
+        now_ms: i64,
+        cfg: &HealthConfig,
+    ) -> bool {
+        if proxy_group.is_empty() {
+            return false;
+        }
+        let map = self.by_scope.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return false;
+        }
+        let key = format!("x:{provider}:{proxy_group}");
+        is_scope_degraded(&map, &key, now_ms, cfg)
+    }
+}
+
+fn is_scope_degraded(
+    map: &HashMap<String, VecDeque<FailureSample>>,
+    key: &str,
+    now_ms: i64,
+    cfg: &HealthConfig,
+) -> bool {
+    let Some(queue) = map.get(key) else {
+        return false;
+    };
+    let cutoff = now_ms.saturating_sub(cfg.wave_window_ms);
+    let mut seen = Vec::with_capacity(cfg.wave_distinct_accounts_trigger);
+    for item in queue.iter().rev() {
+        if item.at_ms < cutoff {
+            break;
+        }
+        if !seen.contains(&item.node_hash) {
+            seen.push(item.node_hash);
+            if seen.len() >= cfg.wave_distinct_accounts_trigger {
+                return true;
             }
         }
-        false
     }
+    false
 }
 
 fn record_in_window(
