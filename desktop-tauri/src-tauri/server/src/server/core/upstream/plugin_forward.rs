@@ -122,8 +122,39 @@ fn is_explicit_pre_exec_rejection(error: &GatewayError) -> bool {
     if matches!(error.status_code, 401 | 402 | 429) {
         return true;
     }
+    if matches!(error.status_code, 400 | 409)
+        && (error.message.contains("TM.00001041")
+            || error.message.contains("Concurrent chats have reached"))
+    {
+        return true;
+    }
     error.status_code == 400
         && (error.message.contains("TM.00001050")
             || error.message.contains("credits have been exhausted")
             || error.message.contains("免费额度已用完"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_explicit_pre_exec_rejection;
+    use crate::server::errors::GatewayError;
+
+    #[test]
+    fn codearts_concurrent_limit_allows_replay_unfreeze() {
+        let err_409 = GatewayError::with_status(
+            409,
+            "上游返回 400（TM.00001041）：Concurrent chats have reached the upper limit (3).",
+        );
+        let err_400 = GatewayError::with_status(
+            400,
+            "Concurrent chats have reached the upper limit (3). Close some chats and try again.",
+        );
+        let generic_409 = GatewayError::with_status(409, "conflict");
+        let err_502 = GatewayError::with_status(502, "TM.00001041");
+
+        assert!(is_explicit_pre_exec_rejection(&err_409));
+        assert!(is_explicit_pre_exec_rejection(&err_400));
+        assert!(!is_explicit_pre_exec_rejection(&generic_409));
+        assert!(!is_explicit_pre_exec_rejection(&err_502));
+    }
 }

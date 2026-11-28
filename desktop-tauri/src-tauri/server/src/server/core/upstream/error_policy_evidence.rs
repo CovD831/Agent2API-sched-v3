@@ -14,6 +14,24 @@ pub(super) fn machine_code(body: &Value) -> String {
     String::new()
 }
 
+fn message_texts(body: &Value) -> impl Iterator<Item = &str> {
+    [
+        body.get("message").and_then(Value::as_str),
+        body["error"].get("message").and_then(Value::as_str),
+        body["detail"].get("message").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+pub(super) fn is_codearts_concurrent_limit(provider: &str, status: u16, body: &Value) -> bool {
+    provider == "codearts"
+        && matches!(status, 400 | 409)
+        && message_texts(body).any(|text| {
+            text.contains("TM.00001041") || text.contains("Concurrent chats have reached")
+        })
+}
+
 pub(super) fn kind(provider: &str, class: &UpstreamErrorClass, status: u16, code: &str, body: &Value) -> ErrorKind {
     if matches!(class, UpstreamErrorClass::ContentBlocked { .. }) { return ErrorKind::Content; }
     if matches!(class, UpstreamErrorClass::TokenExpired { .. }) { return ErrorKind::Auth; }
@@ -40,22 +58,17 @@ pub(super) fn kind(provider: &str, class: &UpstreamErrorClass, status: u16, code
         | "subscription_sharing_route_not_supported" | "subscription_sharing_unsupported_capability") || status == 501 { return ErrorKind::Unsupported; }
     if matches!(code, "content_policy_violation" | "content_filter" | "content_blocked" | "content_policy_rejected"
         | "workbuddy_content_blocked" | "prohibited_content" | "refusal" | "safety" | "runtime_sdk_content") { return ErrorKind::Content; }
-    for text in [
-        body.get("message").and_then(Value::as_str),
-        body["error"].get("message").and_then(Value::as_str),
-        body["detail"].get("message").and_then(Value::as_str),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if text.contains("TM.00001050")
+    if message_texts(body).any(|text| {
+        text.contains("TM.00001050")
             || text.contains("credits have been exhausted")
             || text.contains("免费额度已用完")
             || text.contains("credit balance is too low")
             || text.contains("insufficient balance")
-        {
-            return ErrorKind::Balance;
-        }
+    }) {
+        return ErrorKind::Balance;
+    }
+    if is_codearts_concurrent_limit(provider, status, body) {
+        return ErrorKind::RateLimit;
     }
     if matches!(status, 400 | 413 | 422) || matches!(code, "context_length_exceeded" | "payload_too_large" | "invalid_request_error"
         | "invalid_request" | "context_window_exceeded" | "model_context_window_exceeded") { return ErrorKind::BadRequest; }

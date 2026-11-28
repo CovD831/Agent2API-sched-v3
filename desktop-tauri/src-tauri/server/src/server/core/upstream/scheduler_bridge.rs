@@ -608,7 +608,7 @@ pub(super) fn report_attempt_failure(
         || msg.contains("Concurrent chats have reached")
     {
         AttemptFeedbackKind::RateLimited {
-            reset_at_ms: Some(now_ms + 8_000),
+            reset_at_ms: None,
         }
     } else if error.status_code == 429 {
         let reset = error

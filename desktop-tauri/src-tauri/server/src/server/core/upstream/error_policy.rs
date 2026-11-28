@@ -65,12 +65,15 @@ pub(crate) fn decide_with(snapshot: &config::ErrorPolicySnapshot, provider: &str
         (scope, _) => scope,
     };
     let account_model = matches!(code.as_str(), "account_model_unavailable" | "account_model_permissions_unknown" | "model_not_available_for_account");
-    let hard_stop = explicit_stop || evidence::hard_stop(status, &code)
+    let concurrent_limit = evidence::is_codearts_concurrent_limit(provider, status, body);
+    let hard_stop = explicit_stop || (!concurrent_limit && evidence::hard_stop(status, &code))
         || matches!(kind, ErrorKind::BadRequest | ErrorKind::Content)
         || local && status == 501 && !account_model && !matches!(code.as_str(), "unsupported" | "no_method" | "not_implemented"
             | "route_not_supported" | "subscription_sharing_route_not_supported" | "subscription_sharing_unsupported_capability");
     let mut action = if hard_stop { ErrorAction::ReturnError } else { rule.action };
-    if account_model {
+    if concurrent_limit {
+        scope = CooldownScope::Account;
+    } else if account_model {
         scope = CooldownScope::Model;
         if action == ErrorAction::SwitchProvider { action = ErrorAction::SwitchAccount; }
     } else if kind == ErrorKind::Unsupported && rule.scope == CooldownScope::Auto { scope = CooldownScope::Provider; }
@@ -84,6 +87,9 @@ pub(crate) fn decide_with(snapshot: &config::ErrorPolicySnapshot, provider: &str
         if *at > now && *at <= (1_i64 << 53) - 1 && chrono::DateTime::from_timestamp_millis(*at).is_some() {
             reset_at = Some(reset_at.unwrap_or(*at).max(*at));
         }
+    }
+    if concurrent_limit && reset_at.is_none() {
+        reset_at = now.checked_add(60_000);
     }
     let exception = settings.overrides.iter().any(|item| item.id == rule.id);
     ErrorDecision { rule, kind, action, scope, reset_at, hard_stop, exception, model: model.to_string(),
@@ -125,6 +131,9 @@ pub(super) fn plugin_stops(provider: &str, policy: &crate::server::core::provide
     let code = evidence::machine_code(body);
     let kind = evidence::kind(provider, class, status, &code, body);
     if kind == ErrorKind::Balance { return false; }
+    if evidence::is_codearts_concurrent_limit(provider, status, body) && !policy.suspend_account {
+        return false;
+    }
     let unsupported = kind == ErrorKind::Unsupported;
     policy.suspend_account || policy.stop_switching
         || evidence::hard_stop(status, &code) || !unsupported
@@ -165,5 +174,110 @@ pub(super) fn exclude_provider(service: &super::UpstreamService, providers: &[&s
             let id = crate::server::core::routing_groups::attempt_key(&account);
             if !tried.contains(&id) { tried.push(id); }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{decide_with, plugin_stops};
+    use crate::server::config::error_policy::{CooldownScope, ErrorAction, ErrorKind, ErrorPolicySnapshot};
+    use crate::server::core::providers::adapter::UpstreamErrorClass;
+    use crate::server::core::providers::policy::ErrorPolicy;
+    use crate::server::logging;
+
+    #[test]
+    fn codearts_tm00001041_409_triggers_account_cooldown_and_switch() {
+        let snapshot = ErrorPolicySnapshot::default();
+        let msg = "上游返回 400（TM.00001041）：Concurrent chats have reached the upper limit (3). Close some chats and try again.";
+        let class = UpstreamErrorClass::Fatal {
+            status: 409,
+            message: msg.to_string(),
+            upstream_code: None,
+        };
+        let body = json!({ "message": msg });
+        let before = logging::now_ms();
+        let decision = decide_with(
+            &snapshot,
+            "codearts",
+            "deepseek-v4.1-flash",
+            &class,
+            409,
+            &body,
+            false,
+            false,
+        );
+        let after = logging::now_ms();
+
+        assert_eq!(decision.kind, ErrorKind::RateLimit);
+        assert!(!decision.hard_stop);
+        assert_eq!(decision.action, ErrorAction::SwitchAccount);
+        assert_eq!(decision.scope, CooldownScope::Account);
+        assert!(decision.switches());
+        assert!(decision.cooldown());
+        let reset = decision.reset_at.expect("expected 60s reset_at for CodeArts 409");
+        assert!(reset >= before + 59_000 && reset <= after + 61_000);
+    }
+
+    #[test]
+    fn plugin_stops_allows_codearts_concurrent_limit_unless_suspended() {
+        let msg = "Concurrent chats have reached the upper limit (3).";
+        let class = UpstreamErrorClass::Fatal {
+            status: 409,
+            message: msg.to_string(),
+            upstream_code: None,
+        };
+        let body = json!({ "message": msg });
+        let policy = ErrorPolicy {
+            stop: true,
+            stop_switching: true,
+            suspend_account: false,
+            ..Default::default()
+        };
+        assert!(!plugin_stops("codearts", &policy, &class, 409, &body));
+
+        let suspended = ErrorPolicy {
+            suspend_account: true,
+            ..policy
+        };
+        assert!(plugin_stops("codearts", &suspended, &class, 409, &body));
+    }
+
+    #[test]
+    fn generic_409_remains_hard_stop() {
+        let snapshot = ErrorPolicySnapshot::default();
+        let class = UpstreamErrorClass::Fatal {
+            status: 409,
+            message: "conflict".to_string(),
+            upstream_code: None,
+        };
+        let ca_generic = decide_with(
+            &snapshot,
+            "codearts",
+            "deepseek-v4.1-flash",
+            &class,
+            409,
+            &json!({ "message": "conflict" }),
+            false,
+            false,
+        );
+        assert!(ca_generic.hard_stop);
+        assert!(!ca_generic.switches());
+        assert_eq!(ca_generic.action, ErrorAction::ReturnError);
+
+        let wb_same_msg = decide_with(
+            &snapshot,
+            "workbuddy",
+            "glm-5",
+            &class,
+            409,
+            &json!({ "message": "TM.00001041" }),
+            false,
+            false,
+        );
+        assert!(wb_same_msg.hard_stop);
+        assert!(!wb_same_msg.switches());
+        assert_eq!(wb_same_msg.action, ErrorAction::ReturnError);
     }
 }
